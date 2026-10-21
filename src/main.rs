@@ -3,6 +3,7 @@
 mod app;
 mod canvas;
 mod history;
+mod settings;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -14,6 +15,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Paint",
         options,
-        Box::new(|_cc| Ok(Box::new(app::PaintApp::default()))),
+        Box::new(|cc| Ok(Box::new(app::PaintApp::new(cc)))),
     )
 }
