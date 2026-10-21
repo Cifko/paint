@@ -7,6 +7,7 @@ mod floating;
 mod history;
 mod icons;
 mod settings;
+mod shortcuts;
 mod text;
 
 fn main() -> eframe::Result {

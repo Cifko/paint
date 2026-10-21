@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, CursorIcon, Key, KeyboardShortcut, Modifiers, PointerButton,
-    Pos2, Rect, Sense, Shape, Stroke, TextureFilter, TextureHandle, TextureOptions,
-    TextureWrapMode, Vec2,
+    self, Align2, Color32, ColorImage, CursorIcon, Key, Modifiers, PointerButton, Pos2, Rect,
+    Sense, Shape, Stroke, TextureFilter, TextureHandle, TextureOptions, TextureWrapMode, Vec2,
 };
 
 use crate::canvas::{
@@ -16,6 +15,7 @@ use crate::floating::{Floating, Frame, Handle};
 use crate::history::{Action, History};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
+use crate::shortcuts::Action as Command;
 use crate::text::{self, FontFace, TextStyle};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,14 +30,14 @@ enum Tool {
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, Key, Icon); 7] = [
-        (Tool::Brush, "Brush", Key::B, Icon::Brush),
-        (Tool::Eraser, "Eraser", Key::E, Icon::Eraser),
-        (Tool::Fill, "Fill", Key::G, Icon::Fill),
-        (Tool::Shape, "Shape", Key::S, Icon::Rectangle),
-        (Tool::Grid, "Grid", Key::H, Icon::Grid),
-        (Tool::Select, "Select", Key::M, Icon::Select),
-        (Tool::Text, "Text", Key::T, Icon::Text),
+    const ALL: [(Tool, &'static str, Command, Icon); 7] = [
+        (Tool::Brush, "Brush", Command::ToolBrush, Icon::Brush),
+        (Tool::Eraser, "Eraser", Command::ToolEraser, Icon::Eraser),
+        (Tool::Fill, "Fill", Command::ToolFill, Icon::Fill),
+        (Tool::Shape, "Shape", Command::ToolShape, Icon::Rectangle),
+        (Tool::Grid, "Grid", Command::ToolGrid, Icon::Grid),
+        (Tool::Select, "Select", Command::ToolSelect, Icon::Select),
+        (Tool::Text, "Text", Command::ToolText, Icon::Text),
     ];
 }
 
@@ -94,13 +94,13 @@ enum PendingAction {
     Open(PathBuf),
 }
 
-/// Shortcut keys that pick a shape (and the Shape tool).
-const SHAPE_KEYS: [(Key, ShapeKind); 5] = [
-    (Key::R, ShapeKind::Rectangle),
-    (Key::C, ShapeKind::Ellipse),
-    (Key::N, ShapeKind::NGon),
-    (Key::L, ShapeKind::Line),
-    (Key::P, ShapeKind::Polyline),
+/// Shortcuts that pick a shape (and the Shape tool).
+const SHAPE_ACTIONS: [(Command, ShapeKind); 5] = [
+    (Command::ShapeRectangle, ShapeKind::Rectangle),
+    (Command::ShapeEllipse, ShapeKind::Ellipse),
+    (Command::ShapeNGon, ShapeKind::NGon),
+    (Command::ShapeLine, ShapeKind::Line),
+    (Command::ShapePolyline, ShapeKind::Polyline),
 ];
 
 /// A polyline being clicked out point by point.
@@ -265,6 +265,8 @@ pub struct PaintApp {
     title: String,
     /// Canvas area to bring into view once the canvas size is known.
     center_on: Option<IRect>,
+    /// Screen areas of the floating panels last frame, kept clear when fitting.
+    panel_rects: [Option<Rect>; 2],
     /// Last copied image, used if the system clipboard can't be read.
     clipboard: Option<Image>,
 
@@ -300,44 +302,46 @@ pub struct PaintApp {
 
 impl PaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let settings = cc
+        let settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, Settings::STORAGE_KEY))
             .unwrap_or_default();
+        let d = settings.tool_defaults.clone();
+        let color = |[r, g, b, a]: [u8; 4]| Color32::from_rgba_unmultiplied(r, g, b, a);
         Self {
             layers: vec![Layer::new(1, "Layer 1")],
             active: 0,
             next_layer_id: 2,
-            history: History::new(200),
+            history: History::new(d.undo_steps),
             tool: Tool::Brush,
-            primary: Color32::BLACK,
-            secondary: Color32::WHITE,
+            primary: color(d.color1),
+            secondary: color(d.color2),
             use_secondary: false,
             gesture_button: PointerButton::Primary,
             paint_brush: Brush {
-                size: 8.0,
-                opacity: 1.0,
+                size: d.brush_size,
+                opacity: d.brush_opacity,
             },
             eraser_brush: Brush {
-                size: 24.0,
-                opacity: 1.0,
+                size: d.eraser_size,
+                opacity: d.eraser_opacity,
             },
             text_brush: Brush {
-                size: 32.0,
-                opacity: 1.0,
+                size: d.text_size,
+                opacity: d.text_opacity,
             },
-            fill_tolerance: 32,
-            fill_shapes: false,
+            fill_tolerance: d.fill_tolerance,
+            fill_shapes: d.filled_shapes,
             settings,
             settings_open: false,
             selection: None,
             floating: None,
             text_edit: None,
-            text_face: FontFace::Sans,
+            text_face: d.font,
             grid: None,
             grid_kind: GridKind::Rectangle,
             shape_kind: ShapeKind::Rectangle,
-            ngon_sides: 6,
+            ngon_sides: d.ngon_sides,
             ngon_start: None,
             polyline: None,
             file_path: None,
@@ -348,6 +352,7 @@ impl PaintApp {
             message: None,
             title: String::new(),
             center_on: None,
+            panel_rects: [None; 2],
             clipboard: None,
             offset: Vec2::ZERO,
             zoom: 1.0,
@@ -448,18 +453,37 @@ impl PaintApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() {
+        // While a shortcut is being chosen in the settings, keys go there.
+        if self.settings.capturing.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
-        let shortcut = |m: Modifiers, k: Key| KeyboardShortcut::new(m, k);
-        let (save_as, save, open, new) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::S)),
-                i.consume_shortcut(&shortcut(Modifiers::COMMAND, Key::S)),
-                i.consume_shortcut(&shortcut(Modifiers::COMMAND, Key::O)),
-                i.consume_shortcut(&shortcut(Modifiers::COMMAND, Key::N)),
-            )
-        });
+        let events = ctx.input(|i| i.events.clone());
+        let pressed = |a: Command| self.settings.binding(a).is_some_and(|s| s.pressed(&events));
+        let save_as = pressed(Command::SaveAs);
+        let (save, open, new) = (
+            pressed(Command::Save),
+            pressed(Command::Open),
+            pressed(Command::New),
+        );
+        let (undo, redo) = (
+            pressed(Command::Undo),
+            pressed(Command::Redo) || pressed(Command::RedoAlternative),
+        );
+        let (select_all, copy_merged, swap) = (
+            pressed(Command::SelectAll),
+            pressed(Command::CopyMerged),
+            pressed(Command::SwapColors),
+        );
+        let (fit, reset_view) = (pressed(Command::FitToWindow), pressed(Command::ResetView));
+        let tool = Tool::ALL
+            .into_iter()
+            .find(|(_, _, action, _)| pressed(*action))
+            .map(|(tool, ..)| tool);
+        let shape = SHAPE_ACTIONS
+            .into_iter()
+            .find(|(action, _)| pressed(*action))
+            .map(|(_, kind)| kind);
+
         if save_as || save {
             self.save(save_as);
         }
@@ -470,49 +494,40 @@ impl PaintApp {
             self.request(PendingAction::New);
         }
         if self.text_edit.is_some() {
-            // While typing, the keyboard belongs to the text.
-            self.text_keys(ctx);
+            // While typing, the keyboard belongs to the text; undo drops it.
+            if undo {
+                self.text_edit = None;
+            } else {
+                self.text_keys(ctx);
+            }
             return;
         }
-        let redo_a = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
-        let redo_b = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
-        let undo = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
-        let copy_merged = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::C);
-        let select_all = KeyboardShortcut::new(Modifiers::COMMAND, Key::A);
-        let (do_redo, do_undo, do_copy_merged, do_select_all) = ctx.input_mut(|i| {
-            let redo = i.consume_shortcut(&redo_a) || i.consume_shortcut(&redo_b);
-            (
-                redo,
-                i.consume_shortcut(&undo),
-                i.consume_shortcut(&copy_merged),
-                i.consume_shortcut(&select_all),
-            )
-        });
-        if do_select_all {
+        if select_all {
             self.select_all();
         }
-        if do_copy_merged {
+        if copy_merged {
             self.copy(ctx, true);
         }
-        if do_redo {
+        if redo {
             self.redo();
-        } else if do_undo {
+        } else if undo {
             self.undo();
         }
-        for (tool, _, key, _) in Tool::ALL {
-            if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key)) {
-                self.tool = tool;
-            }
+        if let Some(tool) = tool {
+            self.tool = tool;
         }
-        for (key, kind) in SHAPE_KEYS {
-            if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key)) {
-                self.tool = Tool::Shape;
-                self.shape_kind = kind;
-            }
+        if let Some(kind) = shape {
+            self.tool = Tool::Shape;
+            self.shape_kind = kind;
         }
-
-        if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::X)) {
+        if swap {
             std::mem::swap(&mut self.primary, &mut self.secondary);
+        }
+        if fit {
+            self.fit_to_window();
+        }
+        if reset_view {
+            self.reset_view();
         }
         let (enter, escape, delete) = ctx.input(|i| {
             (
@@ -574,10 +589,7 @@ impl PaintApp {
                     b.insert(&s);
                 }
                 egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
+                    key, pressed: true, ..
                 } => match key {
                     Key::Enter => b.insert("\n"),
                     Key::Tab => b.insert("    "),
@@ -590,7 +602,6 @@ impl PaintApp {
                     Key::Home => b.home(),
                     Key::End => b.end(),
                     Key::Escape => self.commit_text(),
-                    Key::Z if modifiers.command => self.text_edit = None,
                     _ => {}
                 },
                 _ => {}
@@ -715,7 +726,7 @@ impl PaintApp {
         self.next_layer_id += 1;
         self.layers = vec![Layer::new(id, "Layer 1")];
         self.active = 0;
-        self.history = History::new(200);
+        self.history = History::new(self.settings.tool_defaults.undo_steps);
         self.saved_version = self.history.version();
         self.file_path = None;
         self.offset = Vec2::ZERO;
@@ -798,6 +809,53 @@ impl PaintApp {
             (DialogPurpose::SaveAs, Some(path)) => self.save_to(file::with_image_extension(path)),
             (_, None) => self.after_save = None,
         }
+    }
+
+    /// The area covered by the visible layers' drawing.
+    fn drawn_bounds(&self) -> Option<IRect> {
+        let visible = |id: LayerId| self.layers.iter().any(|l| l.id == id && l.visible);
+        let floating = self.floating.as_ref().map(|f| f.rect());
+        self.content_bounds
+            .iter()
+            .filter(|((id, _), _)| visible(*id))
+            .map(|(_, b)| *b)
+            .chain(floating)
+            .reduce(|a, b| a.union(&b))
+    }
+
+    /// Zooms and scrolls so everything drawn is in view, at most at 100%.
+    fn fit_to_window(&mut self) {
+        match self.drawn_bounds() {
+            Some(bounds) => self.center_on = Some(bounds),
+            None => self.reset_view(),
+        }
+    }
+
+    /// The canvas area not covered by the side panels (falls back to the
+    /// whole canvas if they leave too little room).
+    fn free_view(&self, rect: Rect) -> Rect {
+        let mut free = rect;
+        for panel in self.panel_rects.iter().flatten() {
+            if !panel.intersects(rect) {
+                continue;
+            }
+            // Panels hug the left or right edge; trim that side.
+            if panel.center().x < rect.center().x {
+                free.min.x = free.min.x.max(panel.max.x + 8.0);
+            } else {
+                free.max.x = free.max.x.min(panel.min.x - 8.0);
+            }
+        }
+        if free.width() < rect.width() * 0.3 {
+            rect
+        } else {
+            free
+        }
+    }
+
+    fn reset_view(&mut self) {
+        self.offset = Vec2::ZERO;
+        self.zoom = 1.0;
     }
 
     /// The visible layers flattened, cropped to what's drawn.
@@ -934,27 +992,37 @@ impl PaintApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        // Wraps onto a second row when the window is too narrow.
+        ui.horizontal_wrapped(|ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("New").on_hover_text("Ctrl+N").clicked() {
+                // Tooltips are computed up front: the actions below need `self`.
+                let tip = |a: Command| {
+                    self.settings
+                        .binding(a)
+                        .map_or(String::new(), |s| s.label())
+                };
+                let [tip_new, tip_open, tip_save, tip_save_as] =
+                    [Command::New, Command::Open, Command::Save, Command::SaveAs].map(tip);
+                if ui.button("New").on_hover_text(tip_new).clicked() {
                     self.request(PendingAction::New);
                     ui.close();
                 }
-                if ui.button("Open…").on_hover_text("Ctrl+O").clicked() {
+                if ui.button("Open…").on_hover_text(tip_open).clicked() {
                     ui.close();
                     self.open_dialog();
                 }
-                if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
+                if ui.button("Save").on_hover_text(tip_save).clicked() {
                     ui.close();
                     self.save(false);
                 }
-                if ui
-                    .button("Save As…")
-                    .on_hover_text("Ctrl+Shift+S")
-                    .clicked()
-                {
+                if ui.button("Save As…").on_hover_text(tip_save_as).clicked() {
                     ui.close();
                     self.save(true);
+                }
+                ui.separator();
+                if ui.button("Settings…").clicked() {
+                    ui.close();
+                    self.settings_open = true;
                 }
             });
             ui.separator();
@@ -965,7 +1033,7 @@ impl PaintApp {
                     Tool::Shape => shape_icon(self.shape_kind),
                     _ => icon,
                 };
-                let title = format!("{name} ({})", key.name());
+                let title = self.settings.with_shortcut(name, key);
                 let button = icon_button(ui, icon, self.tool == tool);
                 // Tools with kinds show a menu on hover instead of a tooltip.
                 let has_menu = matches!(tool, Tool::Grid | Tool::Shape);
@@ -1046,14 +1114,14 @@ impl PaintApp {
 
             if ui
                 .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
-                .on_hover_text("Ctrl+Z")
+                .on_hover_text(self.settings.with_shortcut("Undo", Command::Undo))
                 .clicked()
             {
                 self.undo();
             }
             if ui
                 .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
-                .on_hover_text("Ctrl+Shift+Z / Ctrl+Y")
+                .on_hover_text(self.settings.with_shortcut("Redo", Command::Redo))
                 .clicked()
             {
                 self.redo();
@@ -1070,7 +1138,10 @@ impl PaintApp {
             }
             if ui
                 .add_enabled(can_copy, egui::Button::new("Copy merged"))
-                .on_hover_text("Copy what's visible on all layers (Ctrl+Shift+C)")
+                .on_hover_text(
+                    self.settings
+                        .with_shortcut("Copy what's visible on all layers", Command::CopyMerged),
+                )
                 .clicked()
             {
                 self.copy(ui.ctx(), true);
@@ -1082,12 +1153,24 @@ impl PaintApp {
 
             ui.label(format!("{:.0}%", self.zoom * 100.0));
             if ui
-                .button("Reset view")
-                .on_hover_text("Back to the origin at 100% (1 image pixel = 1 screen pixel)")
+                .button("Fit")
+                .on_hover_text(self.settings.with_shortcut(
+                    "Fit everything drawn into the window (up to 100%)",
+                    Command::FitToWindow,
+                ))
                 .clicked()
             {
-                self.offset = Vec2::ZERO;
-                self.zoom = 1.0;
+                self.fit_to_window();
+            }
+            if ui
+                .button("Reset view")
+                .on_hover_text(self.settings.with_shortcut(
+                    "Back to the origin at 100% (1 image pixel = 1 screen pixel)",
+                    Command::ResetView,
+                ))
+                .clicked()
+            {
+                self.reset_view();
             }
             ui.separator();
             if ui.button("Settings").clicked() {
@@ -1110,7 +1193,7 @@ impl PaintApp {
         };
         let shown = ctx.animate_value_with_time(height_id.with("animated"), target, 0.18);
         let mut open = has_content;
-        egui::Window::new("Brush")
+        let shown_panel = egui::Window::new("Brush")
             .title_bar(false)
             .resizable(false)
             .open(&mut open)
@@ -1136,6 +1219,7 @@ impl PaintApp {
                     ctx.data_mut(|d| d.insert_temp(height_id, height));
                 }
             });
+        self.panel_rects[0] = shown_panel.map(|r| r.response.rect);
     }
 
     fn brush_panel(&mut self, ui: &mut egui::Ui) {
@@ -1263,7 +1347,7 @@ impl PaintApp {
     }
 
     fn layers_window(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Layers")
+        let layers = egui::Window::new("Layers")
             .resizable(false)
             .collapsible(true)
             .anchor(Align2::RIGHT_TOP, [-10.0, 40.0])
@@ -1326,6 +1410,7 @@ impl PaintApp {
                     ui.add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0));
                 });
             });
+        self.panel_rects[1] = layers.map(|r| r.response.rect);
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -1337,6 +1422,9 @@ impl PaintApp {
             .pivot(Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| settings.ui(ui));
+        if !self.settings_open {
+            self.settings.capturing = None;
+        }
     }
 
     fn add_layer(&mut self) {
@@ -1816,12 +1904,14 @@ impl PaintApp {
         let rect = ui.max_rect();
         self.canvas_rect = rect;
         if let Some(r) = self.center_on.take() {
-            // Fit an opened image into the view (never above 100%).
-            let view = rect.size() * self.pixels_per_point;
-            let fit = (view.x / r.width() as f32).min(view.y / r.height() as f32) * 0.9;
-            self.zoom = fit.min(1.0);
+            // Fit into the part of the view the panels don't cover (never
+            // above 100%).
+            let free = self.free_view(rect);
+            let view = free.size() * self.pixels_per_point;
+            let (w, h) = (r.width().max(1) as f32, r.height().max(1) as f32);
+            self.zoom = ((view.x / w).min(view.y / h) * 0.9).min(1.0);
             let center = Vec2::new((r.x0 + r.x1) as f32 / 2.0, (r.y0 + r.y1) as f32 / 2.0);
-            self.offset = center - rect.size() / self.scale() / 2.0;
+            self.offset = center - (free.center() - rect.min) / self.scale();
         }
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         self.canvas_hover = response.hover_pos();
