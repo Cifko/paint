@@ -5,6 +5,7 @@ mod canvas;
 mod history;
 mod icons;
 mod settings;
+mod text;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

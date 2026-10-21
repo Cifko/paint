@@ -11,6 +11,7 @@ pub enum Icon {
     Ellipse,
     Grid,
     Select,
+    Text,
 }
 
 /// Draws `icon` inside `rect` using `color`.
@@ -93,6 +94,12 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.line_segment([p(t, 0.14), p(t, 0.86)], thin);
                 painter.line_segment([p(0.14, t), p(0.86, t)], thin);
             }
+        }
+        Icon::Text => {
+            let bold = Stroke::new((s * 0.14).max(1.5), color);
+            painter.line_segment([p(0.18, 0.18), p(0.82, 0.18)], bold);
+            painter.line_segment([p(0.5, 0.18), p(0.5, 0.86)], bold);
+            painter.line_segment([p(0.36, 0.86), p(0.64, 0.86)], thin);
         }
         Icon::Select => {
             let pts = [

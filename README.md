@@ -9,12 +9,13 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 - **Infinite canvas** – paint anywhere; pan and zoom freely. 100% zoom is pixel-for-pixel
   with the screen, also on displays with OS scaling (e.g. 150% on Windows).
 - **Tools** – Brush, Eraser, Flood fill, Rectangle and Ellipse (outline or filled),
-  Grid, rectangle Select.
+  Grid, rectangle Select, Text.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
   White is treated as transparent when pasting (toggleable).
 - **Color picker** in the top bar plus a quick palette.
-- **Floating size and opacity sliders** on the left side of the canvas.
+- **Floating size and opacity sliders** on the left side of the canvas. Painting tools
+  share one size/opacity; the eraser and the text tool each keep their own.
 - **Quick brush resize** – hold Alt (Option on macOS) and drag left/right or scroll;
   the key and behavior are configurable in **Settings**.
 - **Layers** – previews, add, delete, reorder, hide, rename, per-layer opacity.
@@ -28,7 +29,7 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | Pan | Middle mouse drag, or Space + left drag |
 | Zoom | Mouse wheel / pinch (around the cursor) |
 | Brush / Eraser / Fill | `B` / `E` / `G` |
-| Rectangle / Ellipse / Grid / Select | `R` / `C` / `T` / `M` |
+| Rectangle / Ellipse / Grid / Select / Text | `R` / `C` / `H` / `M` / `T` |
 | Snap rectangle, ellipse, cell, grid or selection to a square / circle | Hold `Shift` while drawing (configurable) |
 | Select everything that's painted | `Ctrl+A` |
 | Change brush size | Hold `Alt` (`Option` on macOS) + drag left/right or scroll (configurable) |
@@ -39,6 +40,12 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | Place / cancel pasted image | `Enter` or click outside it / `Esc` |
 | Undo | `Ctrl+Z` (`Cmd+Z` on macOS) |
 | Redo | `Ctrl+Shift+Z` or `Ctrl+Y` |
+
+Text: click where the text should start and type, like in a text editor: there's no
+box, `Enter` starts a new line, arrows/Home/End move the caret. `Esc`, clicking
+elsewhere or switching tools places the text; `Ctrl+Z` while typing discards it. The
+size slider sets the font size; the font is chosen in the side panel (DejaVu fonts,
+bundled).
 
 Rectangle and Ellipse: drag from corner to corner of the shape's bounding box. The pen
 size is the outline width.
