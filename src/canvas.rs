@@ -342,29 +342,25 @@ impl PaintOp {
         });
     }
 
-    /// Draws a circle around `center`, either as an outline of width `width` or filled.
-    pub fn circle(
-        &mut self,
-        layer: &mut Layer,
-        center: [f32; 2],
-        radius: f32,
-        width: f32,
-        filled: bool,
-    ) {
+    /// Draws the ellipse inscribed in the pixel-aligned rectangle `r`, either
+    /// filled or outlined with a line of `width` centered on its edge.
+    pub fn ellipse(&mut self, layer: &mut Layer, r: IRect, width: f32, filled: bool) {
         let half = (width / 2.0).max(0.5);
-        let outer = radius + if filled { 0.0 } else { half };
+        let grow = if filled { 0.0 } else { half };
         let area = bbox(
-            center[0] - outer,
-            center[1] - outer,
-            center[0] + outer,
-            center[1] + outer,
+            r.x0 as f32 - grow,
+            r.y0 as f32 - grow,
+            r.x1 as f32 + grow,
+            r.y1 as f32 + grow,
         );
+        let (cx, cy) = ((r.x0 + r.x1) as f32 / 2.0, (r.y0 + r.y1) as f32 / 2.0);
+        let (a, b) = (r.width() as f32 / 2.0, r.height() as f32 / 2.0);
         self.apply(layer, area, |x, y| {
-            let d = ((x - center[0]).powi(2) + (y - center[1]).powi(2)).sqrt();
+            let d = ellipse_distance(x - cx, y - cy, a, b);
             if filled {
-                coverage(radius - d)
+                coverage(-d)
             } else {
-                coverage(half - (d - radius).abs())
+                coverage(half - d.abs())
             }
         });
     }
@@ -376,6 +372,42 @@ impl PaintOp {
         } else {
             Some(self.before.into_iter().collect())
         }
+    }
+}
+
+/// Signed distance from a point (relative to the center) to an ellipse with
+/// semi-axes `a` and `b`; negative inside. Uses a few Newton-like steps to
+/// find the closest point on the curve, so thick outlines stay round.
+fn ellipse_distance(px: f32, py: f32, a: f32, b: f32) -> f32 {
+    let (px, py) = (px.abs(), py.abs());
+    let (a, b) = (a.max(1e-3), b.max(1e-3));
+    if px < 1e-4 && py < 1e-4 {
+        // The center: the iteration below has no direction to work with.
+        return -a.min(b);
+    }
+    let (mut tx, mut ty) = (
+        std::f32::consts::FRAC_1_SQRT_2,
+        std::f32::consts::FRAC_1_SQRT_2,
+    );
+    for _ in 0..4 {
+        let (x, y) = (a * tx, b * ty);
+        let ex = (a * a - b * b) * tx.powi(3) / a;
+        let ey = (b * b - a * a) * ty.powi(3) / b;
+        let (rx, ry) = (x - ex, y - ey);
+        let (qx, qy) = (px - ex, py - ey);
+        let r = rx.hypot(ry);
+        let q = qx.hypot(qy).max(1e-6);
+        tx = ((qx * r / q + ex) / a).clamp(0.0, 1.0);
+        ty = ((qy * r / q + ey) / b).clamp(0.0, 1.0);
+        let t = tx.hypot(ty).max(1e-6);
+        tx /= t;
+        ty /= t;
+    }
+    let d = (px - a * tx).hypot(py - b * ty);
+    if (px / a).powi(2) + (py / b).powi(2) < 1.0 {
+        -d
+    } else {
+        d
     }
 }
 
@@ -710,7 +742,13 @@ mod tests {
                 opacity: 1.0,
             },
         );
-        op.circle(&mut layer, [0.0, 0.0], 20.0, 3.0, false);
+        let circle = IRect {
+            x0: -20,
+            y0: -20,
+            x1: 20,
+            y1: 20,
+        };
+        op.ellipse(&mut layer, circle, 3.0, false);
         let limit = IRect {
             x0: -50,
             y0: -50,
@@ -921,5 +959,66 @@ mod tests {
         };
         let out = white_to_transparent(&img);
         assert_eq!(out.pixels, vec![[0; 4], [250, 255, 255, 255]]);
+    }
+
+    #[test]
+    fn ellipse_distance_is_accurate() {
+        // A circle: distance is just |p| - r.
+        assert!((ellipse_distance(30.0, 40.0, 10.0, 10.0) - 40.0).abs() < 0.01);
+        assert!((ellipse_distance(0.0, 0.0, 10.0, 10.0) + 10.0).abs() < 0.01);
+        // On the axes of an elongated ellipse.
+        assert!((ellipse_distance(25.0, 0.0, 20.0, 5.0) - 5.0).abs() < 0.01);
+        assert!((ellipse_distance(0.0, 9.0, 20.0, 5.0) - 4.0).abs() < 0.01);
+        assert!((ellipse_distance(0.0, 0.0, 20.0, 5.0) + 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn thick_ellipse_outline_is_round() {
+        // A tiny circle with a huge pen: the outside must be a disc of radius r + w/2.
+        let mut layer = Layer::new(1, "L");
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: RED,
+                opacity: 1.0,
+            },
+        );
+        let r = IRect {
+            x0: -5,
+            y0: -5,
+            x1: 5,
+            y1: 5,
+        };
+        op.ellipse(&mut layer, r, 200.0, false);
+        // Radius 105 in every direction, including the diagonals.
+        let inside = 103.0 / std::f32::consts::SQRT_2;
+        let outside = 107.0 / std::f32::consts::SQRT_2;
+        assert_eq!(layer.pixel(103, 0), RED);
+        assert_eq!(layer.pixel(inside as i32, inside as i32), RED);
+        assert_eq!(layer.pixel(outside as i32, outside as i32), [0; 4]);
+        assert_eq!(layer.pixel(107, 0), [0; 4]);
+    }
+
+    #[test]
+    fn ellipse_fits_its_rectangle() {
+        let mut layer = Layer::new(1, "L");
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: RED,
+                opacity: 1.0,
+            },
+        );
+        let r = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 40,
+            y1: 10,
+        };
+        op.ellipse(&mut layer, r, 1.0, true);
+        assert_eq!(layer.pixel(20, 5), RED);
+        assert_eq!(layer.pixel(1, 5), RED);
+        assert_eq!(layer.pixel(40, 5), [0; 4]);
+        assert_eq!(layer.pixel(1, 1), [0; 4], "corners of the box stay empty");
     }
 }
