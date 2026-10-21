@@ -18,6 +18,10 @@ pub enum Icon {
     HexagonGrid,
     Select,
     Text,
+    FlipHorizontal,
+    FlipVertical,
+    RotateLeft,
+    RotateRight,
 }
 
 /// Draws `icon` inside `rect` using `color`.
@@ -152,6 +156,55 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment([p(0.18, 0.18), p(0.82, 0.18)], bold);
             painter.line_segment([p(0.5, 0.18), p(0.5, 0.86)], bold);
             painter.line_segment([p(0.36, 0.86), p(0.64, 0.86)], thin);
+        }
+        Icon::FlipHorizontal | Icon::FlipVertical => {
+            // Two mirrored arrowheads across a dashed axis.
+            let flip = |x: f32, y: f32| {
+                if icon == Icon::FlipHorizontal {
+                    p(x, y)
+                } else {
+                    p(y, x)
+                }
+            };
+            painter.extend(Shape::dashed_line(
+                &[flip(0.5, 0.08), flip(0.5, 0.92)],
+                thin,
+                s * 0.08,
+                s * 0.06,
+            ));
+            painter.add(Shape::convex_polygon(
+                vec![flip(0.4, 0.22), flip(0.4, 0.78), flip(0.08, 0.5)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(
+                vec![flip(0.6, 0.22), flip(0.92, 0.5), flip(0.6, 0.78)],
+                thin,
+            ));
+        }
+        Icon::RotateLeft | Icon::RotateRight => {
+            // Three quarters of a circle, starting at the top, with an
+            // arrowhead at its end pointing the way it turns.
+            let dir = if icon == Icon::RotateRight { 1.0 } else { -1.0 };
+            let sweep = 4.6;
+            let angle = |i: usize| -std::f32::consts::FRAC_PI_2 + dir * i as f32 / 24.0 * sweep;
+            let arc: Vec<Pos2> = (0..=24)
+                .map(|i| p(0.5 + 0.3 * angle(i).cos(), 0.54 + 0.3 * angle(i).sin()))
+                .collect();
+            let end = *arc.last().expect("arc has points");
+            painter.add(Shape::line(arc, thin));
+            let a = angle(24);
+            let travel = Vec2::new(-a.sin(), a.cos()) * dir;
+            let side = Vec2::new(-travel.y, travel.x);
+            painter.add(Shape::convex_polygon(
+                vec![
+                    end + travel * s * 0.16,
+                    end + side * s * 0.13,
+                    end - side * s * 0.13,
+                ],
+                color,
+                Stroke::NONE,
+            ));
         }
         Icon::Select => {
             let pts = [

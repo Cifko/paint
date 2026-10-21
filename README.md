@@ -14,6 +14,8 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 - **Tools** – Brush, Eraser, Flood fill, Shapes (rectangle, ellipse, triangle, regular
   n-gon – outline or filled – line and polyline),
   Grid, rectangle Select, Text.
+- **Transform** – rotate, skew and mirror the selection or a pasted image with handles
+  right on the canvas.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
   Color 2 (white by default) is treated as transparent when pasting (toggleable).
@@ -76,7 +78,16 @@ to size the whole grid and click again. As many whole cells as fit are drawn (e.
 `Shift` the cell becomes regular (square, equilateral triangle, regular hexagon).
 `Esc` cancels.
 
-Pasted images float above the active layer until placed; drag them to move.
+Pasted images float above the active layer until placed; drag them to move. With the
+Select tool, dragging inside the selection lifts its pixels so they can be moved the
+same way. Around a selection or pasted image:
+
+- the round handle above it rotates (`Shift` snaps to 15°),
+- the diamonds on its edges skew it,
+- the bar below it mirrors left/right or top/bottom and turns by 90°.
+
+`Enter` or a click outside places it (one undo step), `Esc` puts things back as they
+were.
 
 Flood fill works on the active layer. Filling an enclosed area paints it. Filling an
 area that is open to infinity (e.g. around a drawn shape) changes the layer's
@@ -114,6 +125,7 @@ Code layout:
 - `src/canvas.rs` – tiled infinite layers, brush/circle rasterization, flood fill,
   copy/paste and thumbnails.
 - `src/history.rs` – undo/redo.
+- `src/floating.rs` – pasted / lifted pieces and their transform handles.
 - `src/file.rs` – loading and saving images.
 - `src/text.rs` – text tool fonts, layout and editing.
 - `src/settings.rs` – user preferences (saved between runs).
