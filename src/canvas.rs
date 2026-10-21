@@ -23,10 +23,6 @@ fn local_index(x: i32, y: i32) -> usize {
     (y.rem_euclid(TILE) * TILE + x.rem_euclid(TILE)) as usize
 }
 
-pub fn empty_tile() -> Vec<Rgba> {
-    vec![[0; 4]; TILE_PIXELS]
-}
-
 /// Inclusive-exclusive integer rectangle in canvas pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IRect {
@@ -63,8 +59,13 @@ pub struct Layer {
     /// Layer opacity used when compositing, 0..=1.
     pub opacity: f32,
     pub tiles: HashMap<TileKey, Vec<Rgba>>,
+    /// Color of every pixel outside the allocated tiles, i.e. of the infinite
+    /// empty area around the drawing. Transparent unless a fill reached infinity.
+    pub default: Rgba,
     /// Tiles changed since the renderer last uploaded them.
     pub dirty: HashSet<TileKey>,
+    /// Set when `default` changes, for the renderer.
+    pub default_changed: bool,
 }
 
 impl Layer {
@@ -75,27 +76,22 @@ impl Layer {
             visible: true,
             opacity: 1.0,
             tiles: HashMap::new(),
+            default: [0; 4],
             dirty: HashSet::new(),
+            default_changed: false,
         }
     }
 
     pub fn pixel(&self, x: i32, y: i32) -> Rgba {
         self.tiles
             .get(&tile_key(x, y))
-            .map_or([0; 4], |t| t[local_index(x, y)])
+            .map_or(self.default, |t| t[local_index(x, y)])
     }
 
-    /// Bounding rectangle of all allocated tiles.
-    pub fn bounds(&self) -> Option<IRect> {
-        self.tiles.keys().fold(None, |acc, &(tx, ty)| {
-            let r = IRect {
-                x0: tx * TILE,
-                y0: ty * TILE,
-                x1: (tx + 1) * TILE,
-                y1: (ty + 1) * TILE,
-            };
-            Some(acc.map_or(r, |a: IRect| a.union(&r)))
-        })
+    /// Changes the color of the infinite empty area, returning the old one.
+    pub fn set_default(&mut self, color: Rgba) -> Rgba {
+        self.default_changed = true;
+        std::mem::replace(&mut self.default, color)
     }
 
     /// Replaces a tile (or removes it with `None`), returning the previous one.
@@ -213,10 +209,15 @@ impl PaintOp {
         src: &impl Fn(i32, i32) -> Option<(f32, Rgba)>,
     ) {
         let erasing = matches!(self.mode, PaintMode::Erase { .. });
-        // Erasing never needs to allocate a tile that doesn't exist yet.
-        if erasing && !layer.tiles.contains_key(&key) && !self.before.contains_key(&key) {
+        // Erasing a transparent area never needs to allocate a tile.
+        if erasing
+            && layer.default[3] == 0
+            && !layer.tiles.contains_key(&key)
+            && !self.before.contains_key(&key)
+        {
             return;
         }
+        let default = layer.default;
         let mut touched = false;
         for y in ys {
             for x in xs.clone() {
@@ -239,12 +240,15 @@ impl PaintOp {
                     .before
                     .entry(key)
                     .or_insert_with(|| layer.tiles.get(&key).cloned());
-                let old = before.as_ref().map_or([0; 4], |t| t[i]);
+                let old = before.as_ref().map_or(default, |t| t[i]);
                 let new = match self.mode {
                     PaintMode::Paint { opacity, .. } => blend_over(old, color, c * opacity),
                     PaintMode::Erase { strength } => erase(old, c * strength),
                 };
-                layer.tiles.entry(key).or_insert_with(empty_tile)[i] = new;
+                layer
+                    .tiles
+                    .entry(key)
+                    .or_insert_with(|| vec![default; TILE_PIXELS])[i] = new;
                 touched = true;
             }
         }
@@ -304,6 +308,17 @@ impl PaintOp {
             let dh = (y - (y0 + k * ch)).abs().max((x0 - x).max(x - x1).max(0.0));
             coverage(half - dv.min(dh))
         });
+    }
+
+    /// Allocates a tile filled with the layer's current default color, so it
+    /// keeps its look when the default changes.
+    pub fn materialize(&mut self, layer: &mut Layer, key: TileKey) {
+        if layer.tiles.contains_key(&key) {
+            return;
+        }
+        self.before.entry(key).or_insert(None);
+        layer.tiles.insert(key, vec![layer.default; TILE_PIXELS]);
+        layer.dirty.insert(key);
     }
 
     /// Composites `image` onto the layer with its top-left corner at (`x`, `y`).
@@ -586,78 +601,266 @@ fn color_matches(a: Rgba, b: Rgba, tolerance: u8) -> bool {
     (0..4).all(|i| a[i].abs_diff(b[i]) <= tolerance)
 }
 
-/// Flood fills the contiguous region around (`x`, `y`) on `layer`.
-///
-/// The canvas is infinite, so the fill is limited to `limit` (typically the
-/// visible area combined with the layer's painted bounds).
-pub fn flood_fill(
-    layer: &mut Layer,
-    x: i32,
-    y: i32,
-    limit: IRect,
-    tolerance: u8,
-    color: Rgba,
-    opacity: f32,
-) -> Option<Vec<(TileKey, Option<Vec<Rgba>>)>> {
-    if !limit.contains(x, y) {
-        return None;
-    }
-    let target = layer.pixel(x, y);
-    let (w, h) = (limit.width() as usize, limit.height() as usize);
-    let mut mask = vec![false; w * h];
-    let idx = |x: i32, y: i32| (y - limit.y0) as usize * w + (x - limit.x0) as usize;
-    let matches = |x: i32, y: i32| color_matches(layer.pixel(x, y), target, tolerance);
+/// What a flood fill changed.
+pub struct FillResult {
+    /// Undo record for the changed tiles.
+    pub tiles: Vec<(TileKey, Option<Vec<Rgba>>)>,
+    /// The layer's previous default color, if the fill reached infinity and
+    /// changed it.
+    pub old_default: Option<Rgba>,
+}
 
-    // Scanline fill.
-    let mut stack = vec![(x, y)];
-    while let Some((sx, sy)) = stack.pop() {
-        if mask[idx(sx, sy)] || !matches(sx, sy) {
-            continue;
+/// The pixels reached by a flood fill. Unallocated tiles are uniform, so they
+/// are tracked whole instead of per pixel.
+struct Region {
+    /// Allocated tiles at the time of the fill.
+    existing: HashSet<TileKey>,
+    /// Range of allocated tiles (min x, min y, max x, max y), if any.
+    tile_bounds: Option<(i32, i32, i32, i32)>,
+    /// Reached pixels inside allocated tiles.
+    pixels: HashMap<TileKey, Vec<bool>>,
+    /// Reached unallocated tiles inside `tile_bounds`.
+    tiles: HashSet<TileKey>,
+    /// Whether the fill escaped past all allocated tiles, i.e. is unbounded.
+    infinite: bool,
+}
+
+impl Region {
+    fn within_bounds(&self, k: TileKey) -> bool {
+        self.tile_bounds
+            .is_some_and(|(x0, y0, x1, y1)| k.0 >= x0 && k.0 <= x1 && k.1 >= y0 && k.1 <= y1)
+    }
+
+    fn contains(&self, x: i32, y: i32) -> bool {
+        let k = tile_key(x, y);
+        if self.existing.contains(&k) {
+            self.pixels.get(&k).is_some_and(|m| m[local_index(x, y)])
+        } else if self.within_bounds(k) {
+            self.tiles.contains(&k)
+        } else {
+            self.infinite
         }
-        let mut lx = sx;
-        while lx > limit.x0 && !mask[idx(lx - 1, sy)] && matches(lx - 1, sy) {
-            lx -= 1;
+    }
+
+    /// Whether anything in tile `k` was reached.
+    fn touches_tile(&self, k: TileKey) -> bool {
+        if self.existing.contains(&k) {
+            self.pixels.contains_key(&k)
+        } else if self.within_bounds(k) {
+            self.tiles.contains(&k)
+        } else {
+            self.infinite
         }
-        let mut rx = sx;
-        while rx + 1 < limit.x1 && !mask[idx(rx + 1, sy)] && matches(rx + 1, sy) {
-            rx += 1;
+    }
+}
+
+/// The pixels of tile `to` that border the neighboring tile `from`.
+fn edge_pixels(from: TileKey, to: TileKey) -> impl Iterator<Item = (i32, i32)> {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    (0..TILE).map(move |i| match (dx, dy) {
+        (1, _) => (to.0 * TILE, to.1 * TILE + i),
+        (-1, _) => (to.0 * TILE + TILE - 1, to.1 * TILE + i),
+        (_, 1) => (to.0 * TILE + i, to.1 * TILE),
+        _ => (to.0 * TILE + i, to.1 * TILE + TILE - 1),
+    })
+}
+
+fn find_region(layer: &Layer, x: i32, y: i32, matches: impl Fn(Rgba) -> bool) -> Region {
+    let existing: HashSet<TileKey> = layer.tiles.keys().copied().collect();
+    let tile_bounds = existing.iter().fold(None, |acc, &(tx, ty)| {
+        Some(match acc {
+            None => (tx, ty, tx, ty),
+            Some((a, b, c, d)) => (tx.min(a), ty.min(b), tx.max(c), ty.max(d)),
+        })
+    });
+    let mut region = Region {
+        existing,
+        tile_bounds,
+        pixels: HashMap::new(),
+        tiles: HashSet::new(),
+        infinite: false,
+    };
+
+    enum Node {
+        Pixel(i32, i32),
+        Tile(TileKey),
+        Infinity,
+    }
+    let node_for_tile = |region: &Region, k: TileKey| {
+        if region.within_bounds(k) {
+            Node::Tile(k)
+        } else {
+            Node::Infinity
         }
-        for px in lx..=rx {
-            mask[idx(px, sy)] = true;
+    };
+    let node_at = |region: &Region, x: i32, y: i32| {
+        let k = tile_key(x, y);
+        if region.existing.contains(&k) {
+            Node::Pixel(x, y)
+        } else {
+            node_for_tile(region, k)
         }
-        for ny in [sy - 1, sy + 1] {
-            if ny < limit.y0 || ny >= limit.y1 {
-                continue;
+    };
+
+    let mut stack = vec![node_at(&region, x, y)];
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Pixel(x, y) => {
+                let k = tile_key(x, y);
+                let i = local_index(x, y);
+                if region.pixels.get(&k).is_some_and(|m| m[i]) || !matches(layer.pixel(x, y)) {
+                    continue;
+                }
+                region
+                    .pixels
+                    .entry(k)
+                    .or_insert_with(|| vec![false; TILE_PIXELS])[i] = true;
+                for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                    stack.push(node_at(&region, nx, ny));
+                }
             }
-            let mut px = lx;
-            while px <= rx {
-                if !mask[idx(px, ny)] && matches(px, ny) {
-                    stack.push((px, ny));
-                    // Skip the rest of this run; it'll be filled from the pushed seed.
-                    while px <= rx && matches(px, ny) {
-                        px += 1;
+            Node::Tile(k) => {
+                if region.tiles.contains(&k) || !matches(layer.default) {
+                    continue;
+                }
+                region.tiles.insert(k);
+                for nk in [
+                    (k.0 - 1, k.1),
+                    (k.0 + 1, k.1),
+                    (k.0, k.1 - 1),
+                    (k.0, k.1 + 1),
+                ] {
+                    if region.existing.contains(&nk) {
+                        stack.extend(edge_pixels(k, nk).map(|(x, y)| Node::Pixel(x, y)));
+                    } else {
+                        stack.push(node_for_tile(&region, nk));
                     }
-                } else {
-                    px += 1;
+                }
+            }
+            Node::Infinity => {
+                if region.infinite || !matches(layer.default) {
+                    continue;
+                }
+                region.infinite = true;
+                // Everything outside the allocated range is one connected
+                // area; it borders the tiles on the edge of that range.
+                let Some((x0, y0, x1, y1)) = region.tile_bounds else {
+                    continue;
+                };
+                let mut border = Vec::new();
+                for tx in x0..=x1 {
+                    border.push(((tx, y0), (tx, y0 - 1)));
+                    border.push(((tx, y1), (tx, y1 + 1)));
+                }
+                for ty in y0..=y1 {
+                    border.push(((x0, ty), (x0 - 1, ty)));
+                    border.push(((x1, ty), (x1 + 1, ty)));
+                }
+                for (k, outside) in border {
+                    if region.existing.contains(&k) {
+                        stack.extend(edge_pixels(outside, k).map(|(x, y)| Node::Pixel(x, y)));
+                    } else {
+                        stack.push(Node::Tile(k));
+                    }
                 }
             }
         }
     }
+    region
+}
 
-    // Grow the region by one pixel so it tucks under anti-aliased edges
-    // instead of leaving a light seam between the fill and the outline.
-    let filled = |x: i32, y: i32| limit.contains(x, y) && mask[idx(x, y)];
+/// Flood fills the contiguous region around (`x`, `y`) on `layer`.
+///
+/// If the region is enclosed, its pixels are painted. If it reaches past
+/// everything drawn (out to infinity), the layer's default color changes to
+/// the fill color instead, while enclosed areas keep their current look.
+pub fn flood_fill(
+    layer: &mut Layer,
+    x: i32,
+    y: i32,
+    tolerance: u8,
+    color: Rgba,
+    opacity: f32,
+) -> Option<FillResult> {
+    let target = layer.pixel(x, y);
+    let region = find_region(layer, x, y, |p| color_matches(p, target, tolerance));
+
     let mut op = PaintOp::new(layer.id, PaintMode::Paint { color, opacity });
-    op.apply(layer, limit, |fx, fy| {
-        let (px, py) = (fx.floor() as i32, fy.floor() as i32);
-        let hit = filled(px, py)
-            || filled(px - 1, py)
-            || filled(px + 1, py)
-            || filled(px, py - 1)
-            || filled(px, py + 1);
-        if hit { 1.0 } else { 0.0 }
-    });
-    op.finish()
+    // Paint reached pixels in allocated tiles, growing the region by one
+    // pixel so it tucks under anti-aliased edges instead of leaving a seam.
+    let filled = |x: i32, y: i32| {
+        region.contains(x, y)
+            || region.contains(x - 1, y)
+            || region.contains(x + 1, y)
+            || region.contains(x, y - 1)
+            || region.contains(x, y + 1)
+    };
+    let mut keys: Vec<TileKey> = region.existing.iter().copied().collect();
+    keys.sort_unstable();
+    for k in keys {
+        let near = [
+            k,
+            (k.0 - 1, k.1),
+            (k.0 + 1, k.1),
+            (k.0, k.1 - 1),
+            (k.0, k.1 + 1),
+        ];
+        if !near.iter().any(|&n| region.touches_tile(n)) {
+            continue;
+        }
+        let area = IRect {
+            x0: k.0 * TILE,
+            y0: k.1 * TILE,
+            x1: (k.0 + 1) * TILE,
+            y1: (k.1 + 1) * TILE,
+        };
+        op.apply(layer, area, |fx, fy| {
+            if filled(fx.floor() as i32, fy.floor() as i32) {
+                1.0
+            } else {
+                0.0
+            }
+        });
+    }
+
+    let mut old_default = None;
+    if region.infinite {
+        // Empty tiles the fill didn't reach are enclosed: pin their current
+        // color before the default changes underneath them.
+        if let Some((x0, y0, x1, y1)) = region.tile_bounds {
+            for ty in y0..=y1 {
+                for tx in x0..=x1 {
+                    let k = (tx, ty);
+                    if !region.existing.contains(&k) && !region.tiles.contains(&k) {
+                        op.materialize(layer, k);
+                    }
+                }
+            }
+        }
+        let new = blend_over(layer.default, color, opacity);
+        if new != layer.default {
+            old_default = Some(layer.set_default(new));
+        }
+    } else {
+        for &k in &region.tiles {
+            let area = IRect {
+                x0: k.0 * TILE,
+                y0: k.1 * TILE,
+                x1: (k.0 + 1) * TILE,
+                y1: (k.1 + 1) * TILE,
+            };
+            op.apply(layer, area, |_, _| 1.0);
+        }
+    }
+
+    let tiles = op.finish();
+    if tiles.is_none() && old_default.is_none() {
+        return None;
+    }
+    Some(FillResult {
+        tiles: tiles.unwrap_or_default(),
+        old_default,
+    })
 }
 
 #[cfg(test)]
@@ -749,14 +952,12 @@ mod tests {
             y1: 20,
         };
         op.ellipse(&mut layer, circle, 3.0, false);
-        let limit = IRect {
-            x0: -50,
-            y0: -50,
-            x1: 50,
-            y1: 50,
-        };
         let blue = [0, 0, 255, 255];
-        flood_fill(&mut layer, 0, 0, limit, 32, blue, 1.0).unwrap();
+        let r = flood_fill(&mut layer, 0, 0, 32, blue, 1.0).unwrap();
+        assert!(
+            r.old_default.is_none(),
+            "an enclosed fill must not change the default"
+        );
         assert_eq!(layer.pixel(0, 0), blue);
         assert_eq!(layer.pixel(10, -5), blue);
         assert_eq!(
@@ -767,18 +968,15 @@ mod tests {
     }
 
     #[test]
-    fn flood_fill_empty_layer_fills_limit() {
+    fn flood_fill_empty_layer_changes_default() {
         let mut layer = Layer::new(1, "L");
-        let limit = IRect {
-            x0: -10,
-            y0: -10,
-            x1: 10,
-            y1: 10,
-        };
-        flood_fill(&mut layer, 0, 0, limit, 0, RED, 1.0).unwrap();
-        assert_eq!(layer.pixel(-10, -10), RED);
-        assert_eq!(layer.pixel(9, 9), RED);
-        assert_eq!(layer.pixel(10, 10), [0; 4]);
+        let r = flood_fill(&mut layer, 0, 0, 0, RED, 1.0).unwrap();
+        assert_eq!(r.old_default, Some([0; 4]));
+        assert!(
+            layer.tiles.is_empty(),
+            "no pixels needed for an infinite fill"
+        );
+        assert_eq!(layer.pixel(-100_000, 50_000), RED);
     }
 
     #[test]
@@ -1020,5 +1218,88 @@ mod tests {
         assert_eq!(layer.pixel(1, 5), RED);
         assert_eq!(layer.pixel(40, 5), [0; 4]);
         assert_eq!(layer.pixel(1, 1), [0; 4], "corners of the box stay empty");
+    }
+
+    fn ring(layer: &mut Layer, r: IRect) {
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: [0, 0, 0, 255],
+                opacity: 1.0,
+            },
+        );
+        op.ellipse(layer, r, 3.0, false);
+    }
+
+    #[test]
+    fn fill_outside_shape_changes_background_keeps_inside() {
+        let mut layer = Layer::new(1, "L");
+        ring(
+            &mut layer,
+            IRect {
+                x0: -40,
+                y0: -40,
+                x1: 40,
+                y1: 40,
+            },
+        );
+        let r = flood_fill(&mut layer, 100, 0, 32, RED, 1.0).unwrap();
+        assert_eq!(r.old_default, Some([0; 4]));
+        assert_eq!(layer.pixel(0, 0), [0; 4], "inside stays as it was");
+        assert_eq!(layer.pixel(60, 0), RED, "outside next to the shape");
+        assert_eq!(layer.pixel(5_000, -9_000), RED, "far away");
+    }
+
+    #[test]
+    fn fill_outside_keeps_enclosed_empty_tiles() {
+        // A ring big enough that whole tiles inside it were never allocated.
+        let mut layer = Layer::new(1, "L");
+        ring(
+            &mut layer,
+            IRect {
+                x0: -900,
+                y0: -900,
+                x1: 900,
+                y1: 900,
+            },
+        );
+        assert!(!layer.tiles.contains_key(&(0, 0)));
+        flood_fill(&mut layer, 2000, 0, 32, RED, 1.0).unwrap();
+        assert_eq!(
+            layer.pixel(10, 10),
+            [0; 4],
+            "enclosed empty tile keeps its color"
+        );
+        assert_eq!(layer.pixel(2000, 2000), RED);
+    }
+
+    #[test]
+    fn fill_inside_after_background_fill() {
+        let mut layer = Layer::new(1, "L");
+        ring(
+            &mut layer,
+            IRect {
+                x0: -40,
+                y0: -40,
+                x1: 40,
+                y1: 40,
+            },
+        );
+        flood_fill(&mut layer, 100, 0, 32, RED, 1.0).unwrap();
+        let blue = [0, 0, 255, 255];
+        let r = flood_fill(&mut layer, 0, 0, 32, blue, 1.0).unwrap();
+        assert!(r.old_default.is_none());
+        assert_eq!(layer.pixel(0, 0), blue);
+        assert_eq!(layer.pixel(100, 0), RED);
+    }
+
+    #[test]
+    fn erase_on_filled_background_allocates() {
+        let mut layer = Layer::new(1, "L");
+        flood_fill(&mut layer, 0, 0, 0, RED, 1.0).unwrap();
+        let mut op = PaintOp::new(1, PaintMode::Erase { strength: 1.0 });
+        op.stroke_segment(&mut layer, [0.0, 0.0], [0.0, 0.0], 3.0);
+        assert_eq!(layer.pixel(0, 0), [0; 4]);
+        assert_eq!(layer.pixel(10, 0), RED);
     }
 }

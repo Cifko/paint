@@ -53,8 +53,11 @@ to size the whole grid and click again. As many whole cells as fit are drawn (e.
 
 Pasted images float above the active layer until placed; drag them to move.
 
-Flood fill works on the active layer. Because the canvas is infinite, a fill
-is limited to the visible area plus the area the layer already has paint in.
+Flood fill works on the active layer. Filling an enclosed area paints it. Filling an
+area that is open to infinity (e.g. around a drawn shape) changes the layer's
+background color everywhere, out to infinity, while enclosed areas keep their look:
+draw a circle, fill outside it with red, and the inside stays white. Undo restores
+the previous background.
 
 ## Build & run
 
