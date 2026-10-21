@@ -3,17 +3,17 @@
 use eframe::egui::{self, Modifiers};
 use serde::{Deserialize, Serialize};
 
-/// Modifier key that, while held, turns mouse drag / wheel into brush resizing.
+/// A modifier key that can be assigned to an action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResizeModifier {
+pub enum ModifierKey {
     Alt,
     Ctrl,
     Shift,
     Disabled,
 }
 
-impl ResizeModifier {
-    const ALL: [ResizeModifier; 4] = [Self::Alt, Self::Ctrl, Self::Shift, Self::Disabled];
+impl ModifierKey {
+    const ALL: [ModifierKey; 4] = [Self::Alt, Self::Ctrl, Self::Shift, Self::Disabled];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -38,22 +38,29 @@ impl ResizeModifier {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub resize_modifier: ResizeModifier,
+    /// Held to change the brush size by dragging / scrolling.
+    pub resize_modifier: ModifierKey,
     /// Resize by dragging left/right while the modifier is held.
     pub resize_with_drag: bool,
     /// Resize with the mouse wheel while the modifier is held.
     pub resize_with_wheel: bool,
     /// Multiplier for how fast the size changes.
     pub resize_sensitivity: f32,
+    /// Held while drawing a rectangle (selection, shape, grid) to make it square.
+    pub square_modifier: ModifierKey,
+    /// Make pure white pixels of pasted images transparent.
+    pub paste_white_transparent: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            resize_modifier: ResizeModifier::Alt,
+            resize_modifier: ModifierKey::Alt,
             resize_with_drag: true,
             resize_with_wheel: true,
             resize_sensitivity: 1.0,
+            square_modifier: ModifierKey::Shift,
+            paste_white_transparent: true,
         }
     }
 }
@@ -68,13 +75,7 @@ impl Settings {
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
                 ui.label("Hold key");
-                egui::ComboBox::from_id_salt("resize_modifier")
-                    .selected_text(self.resize_modifier.label())
-                    .show_ui(ui, |ui| {
-                        for m in ResizeModifier::ALL {
-                            ui.selectable_value(&mut self.resize_modifier, m, m.label());
-                        }
-                    });
+                key_combo(ui, "resize_modifier", &mut self.resize_modifier);
                 ui.end_row();
 
                 ui.label("Change size by");
@@ -90,12 +91,45 @@ impl Settings {
                 );
                 ui.end_row();
             });
-        if cfg!(target_os = "linux") && self.resize_modifier == ResizeModifier::Alt {
+        if cfg!(target_os = "linux") && self.resize_modifier == ModifierKey::Alt {
             ui.small("Note: some Linux desktops use Alt + drag to move windows.");
         }
+
+        ui.separator();
+        ui.heading("Rectangles");
+        ui.horizontal(|ui| {
+            ui.label("Snap to square while holding");
+            key_combo(ui, "square_modifier", &mut self.square_modifier);
+        });
+        if self.square_modifier != ModifierKey::Disabled
+            && self.square_modifier == self.resize_modifier
+            && self.resize_with_drag
+        {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Same key as brush resizing: pressing it starts a resize instead.",
+            );
+        }
+
+        ui.separator();
+        ui.heading("Paste");
+        ui.checkbox(
+            &mut self.paste_white_transparent,
+            "Treat white as transparent",
+        );
         ui.separator();
         if ui.button("Restore defaults").clicked() {
             *self = Self::default();
         }
     }
+}
+
+fn key_combo(ui: &mut egui::Ui, id: &str, key: &mut ModifierKey) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(key.label())
+        .show_ui(ui, |ui| {
+            for m in ModifierKey::ALL {
+                ui.selectable_value(key, m, m.label());
+            }
+        });
 }
