@@ -205,6 +205,8 @@ const TEXTURE_OPTIONS: TextureOptions = TextureOptions {
 };
 
 const MIN_SIZE: f32 = 1.0;
+/// Width of the tool options panel on the left.
+const PANEL_WIDTH: f32 = 64.0;
 const MAX_SIZE: f32 = 300.0;
 /// Resolution of layer thumbnails in pixels.
 const THUMB: usize = 64;
@@ -1094,21 +1096,69 @@ impl PaintApp {
         });
     }
 
+    /// The side panel with the current tool's options. It only shows what
+    /// the tool uses, hides when there's nothing to show, and animates its
+    /// height (and fades) when that changes.
     fn brush_window(&mut self, ctx: &egui::Context) {
+        let has_content = self.tool != Tool::Select || self.floating.is_some();
+        let height_id = egui::Id::unique("brush_panel_height");
+        let measured: Option<f32> = ctx.data(|d| d.get_temp(height_id));
+        let target = if has_content {
+            measured.unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let shown = ctx.animate_value_with_time(height_id.with("animated"), target, 0.18);
+        let mut open = has_content;
         egui::Window::new("Brush")
             .title_bar(false)
             .resizable(false)
+            .open(&mut open)
             .anchor(Align2::LEFT_CENTER, [10.0, 0.0])
             .show(ctx, |ui| {
-                ui.set_width(64.0);
-                // The slider's built-in value box would pull it to the left, so
-                // the value gets its own box below the slider.
-                let brush = match self.tool {
-                    Tool::Eraser => &mut self.eraser_brush,
-                    Tool::Text => &mut self.text_brush,
-                    _ => &mut self.paint_brush,
-                };
-                ui.vertical_centered(|ui| {
+                ui.set_width(PANEL_WIDTH);
+                // Lay the contents out at full height but only show (and
+                // take up) the animated height.
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(PANEL_WIDTH, shown), Sense::hover());
+                let mut content = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(Rect::from_min_size(
+                            rect.min,
+                            Vec2::new(PANEL_WIDTH, f32::INFINITY),
+                        ))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                content.set_clip_rect(rect.intersect(ui.clip_rect()));
+                if has_content {
+                    self.brush_panel(&mut content);
+                    let height = content.min_rect().height();
+                    ctx.data_mut(|d| d.insert_temp(height_id, height));
+                }
+            });
+    }
+
+    fn brush_panel(&mut self, ui: &mut egui::Ui) {
+        // Separators go between sections, not before the first one.
+        let mut sections = 0;
+        let mut section = |ui: &mut egui::Ui| {
+            if sections > 0 {
+                ui.separator();
+            }
+            sections += 1;
+        };
+        if self.tool != Tool::Select {
+            section(ui);
+            // The slider's built-in value box would pull it to the left, so
+            // the value gets its own box below the slider.
+            let uses_size = self.tool != Tool::Fill;
+            let brush = match self.tool {
+                Tool::Eraser => &mut self.eraser_brush,
+                Tool::Text => &mut self.text_brush,
+                _ => &mut self.paint_brush,
+            };
+            ui.vertical_centered(|ui| {
+                if uses_size {
                     ui.label("Size");
                     centered_slider(
                         ui,
@@ -1123,89 +1173,93 @@ impl PaintApp {
                             .max_decimals(0),
                     );
                     ui.add_space(8.0);
-                    ui.label("Opacity");
-                    let mut pct = brush.opacity * 100.0;
+                }
+                ui.label("Opacity");
+                let mut pct = brush.opacity * 100.0;
+                centered_slider(
+                    ui,
+                    egui::Slider::new(&mut pct, 1.0..=100.0)
+                        .vertical()
+                        .show_value(false),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut pct)
+                        .range(1.0..=100.0)
+                        .max_decimals(0)
+                        .suffix("%"),
+                );
+                brush.opacity = pct / 100.0;
+                if self.tool == Tool::Shape && self.shape_kind == ShapeKind::NGon {
+                    ui.add_space(8.0);
+                    ui.label("Sides");
                     centered_slider(
                         ui,
-                        egui::Slider::new(&mut pct, 1.0..=100.0)
+                        egui::Slider::new(&mut self.ngon_sides, 3..=20)
                             .vertical()
                             .show_value(false),
                     );
-                    ui.add(
-                        egui::DragValue::new(&mut pct)
-                            .range(1.0..=100.0)
-                            .max_decimals(0)
-                            .suffix("%"),
-                    );
-                    brush.opacity = pct / 100.0;
-                    if self.tool == Tool::Shape && self.shape_kind == ShapeKind::NGon {
-                        ui.add_space(8.0);
-                        ui.label("Sides");
-                        centered_slider(
-                            ui,
-                            egui::Slider::new(&mut self.ngon_sides, 3..=20)
-                                .vertical()
-                                .show_value(false),
-                        );
-                        ui.add(egui::DragValue::new(&mut self.ngon_sides).range(3..=20));
-                    }
-                });
-                match self.tool {
-                    Tool::Fill => {
-                        ui.separator();
-                        ui.label("Tolerance");
-                        ui.add(egui::DragValue::new(&mut self.fill_tolerance).range(0..=255));
-                    }
-                    Tool::Shape if self.shape_kind.can_fill() => {
-                        ui.separator();
-                        ui.checkbox(&mut self.fill_shapes, "Filled");
-                    }
-                    Tool::Shape if self.shape_kind == ShapeKind::Polyline => {
-                        ui.separator();
-                        ui.small(
-                            "Click to add points. Double-click or Enter to finish; \
-                             click the first point to close.",
-                        );
-                    }
-                    Tool::Text => {
-                        ui.separator();
-                        ui.label("Font");
-                        egui::ComboBox::from_id_salt("font")
-                            .width(52.0)
-                            .selected_text(self.text_face.label())
-                            .show_ui(ui, |ui| {
-                                for f in FontFace::ALL {
-                                    ui.selectable_value(&mut self.text_face, f, f.label());
-                                }
-                            });
-                    }
-                    Tool::Grid => {
-                        ui.separator();
-                        ui.small(match self.grid {
-                            None => "Click to start the first cell",
-                            Some(GridState::Cell { .. }) => "Click to set the cell size",
-                            Some(GridState::Grid { .. }) => "Click to set the grid size",
-                        });
-                    }
-                    _ => {}
-                }
-                if self.floating.is_some() {
-                    ui.separator();
-                    ui.checkbox(
-                        &mut self.settings.paste_secondary_transparent,
-                        "Color 2 → clear",
-                    )
-                    .on_hover_text("Treat pixels of color 2 in the pasted image as transparent");
-                    ui.vertical_centered_justified(|ui| {
-                        if ui.button("Place").on_hover_text("Enter").clicked() {
-                            self.place_floating();
-                        }
-                        if ui.button("Cancel").on_hover_text("Esc").clicked() {
-                            self.cancel_floating();
-                        }
-                    });
+                    ui.add(egui::DragValue::new(&mut self.ngon_sides).range(3..=20));
                 }
             });
+        }
+        match self.tool {
+            Tool::Fill => {
+                section(ui);
+                ui.label("Tolerance");
+                ui.add(egui::DragValue::new(&mut self.fill_tolerance).range(0..=255));
+            }
+            Tool::Shape if self.shape_kind.can_fill() => {
+                section(ui);
+                ui.checkbox(&mut self.fill_shapes, "Filled");
+            }
+            Tool::Shape if self.shape_kind == ShapeKind::Polyline => {
+                section(ui);
+                ui.small(
+                    "Click to add points. Double-click or Enter to finish; \
+                     click the first point to close.",
+                );
+            }
+            Tool::Text => {
+                section(ui);
+                ui.label("Font");
+                egui::ComboBox::from_id_salt("font")
+                    .width(52.0)
+                    .selected_text(self.text_face.label())
+                    .show_ui(ui, |ui| {
+                        for f in FontFace::ALL {
+                            ui.selectable_value(&mut self.text_face, f, f.label());
+                        }
+                    });
+            }
+            Tool::Grid => {
+                section(ui);
+                ui.small(match self.grid {
+                    None => "Click to start the first cell",
+                    Some(GridState::Cell { .. }) => "Click to set the cell size",
+                    Some(GridState::Grid { .. }) => "Click to set the grid size",
+                });
+            }
+            _ => {}
+        }
+        if let Some(f) = &self.floating {
+            section(ui);
+            // Only pasted images can key out color 2.
+            if f.keyable {
+                ui.checkbox(
+                    &mut self.settings.paste_secondary_transparent,
+                    "Color 2 → clear",
+                )
+                .on_hover_text("Treat pixels of color 2 in the pasted image as transparent");
+            }
+            ui.vertical_centered_justified(|ui| {
+                if ui.button("Place").on_hover_text("Enter").clicked() {
+                    self.place_floating();
+                }
+                if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                    self.cancel_floating();
+                }
+            });
+        }
     }
 
     fn layers_window(&mut self, ctx: &egui::Context) {
