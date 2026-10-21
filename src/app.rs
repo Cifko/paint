@@ -478,10 +478,7 @@ impl PaintApp {
             return;
         };
         let style = self.text_style();
-        let mode = PaintMode::Paint {
-            color: self.color.to_array(),
-            opacity: self.text_brush.opacity,
-        };
+        let mode = self.color_mode(self.text_brush.opacity);
         let mut op = PaintOp::new(self.active_layer_id(), mode);
         draw_text(
             &mut op,
@@ -510,10 +507,22 @@ impl PaintApp {
                 &mut self.color,
                 egui::color_picker::Alpha::Opaque,
             );
-            for c in PALETTE {
-                let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+            for c in PALETTE.into_iter().chain([Color32::TRANSPARENT]) {
+                let (rect, mut resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
                 let selected = c == self.color;
-                ui.painter().rect_filled(rect, 3.0, c);
+                if c == Color32::TRANSPARENT {
+                    // The clear color: white with a red slash, like "no color".
+                    ui.painter().rect_filled(rect, 3.0, Color32::WHITE);
+                    ui.painter().line_segment(
+                        [rect.left_bottom(), rect.right_top()],
+                        Stroke::new(2.0, Color32::from_rgb(220, 40, 40)),
+                    );
+                    resp = resp.on_hover_text(
+                        "Clear: fill, brush, shapes and text erase instead of painting",
+                    );
+                } else {
+                    ui.painter().rect_filled(rect, 3.0, c);
+                }
                 ui.painter().rect_stroke(
                     rect,
                     3.0,
@@ -1108,10 +1117,28 @@ impl PaintApp {
             Tool::Eraser => PaintMode::Erase {
                 strength: self.brush().opacity,
             },
-            _ => PaintMode::Paint {
+            _ => self.color_mode(self.brush().opacity),
+        }
+    }
+
+    /// Painting with the current color; the clear color erases instead.
+    fn color_mode(&self, opacity: f32) -> PaintMode {
+        if self.color == Color32::TRANSPARENT {
+            PaintMode::Erase { strength: opacity }
+        } else {
+            PaintMode::Paint {
                 color: self.color.to_array(),
-                opacity: self.brush().opacity,
-            },
+                opacity,
+            }
+        }
+    }
+
+    /// Color for on-screen previews; erasing shapes preview in gray.
+    fn preview_color(&self) -> Color32 {
+        if self.color == Color32::TRANSPARENT {
+            Color32::from_gray(128).gamma_multiply(0.6)
+        } else {
+            self.color.gamma_multiply(self.brush().opacity)
         }
     }
 
@@ -1166,12 +1193,10 @@ impl PaintApp {
                 });
             }
             Tool::Fill => {
+                let mode = self.color_mode(brush.opacity);
                 let layer = &mut self.layers[self.active];
                 let (x, y) = (p[0].floor() as i32, p[1].floor() as i32);
-                let color = self.color.to_array();
-                if let Some(fill) =
-                    canvas::flood_fill(layer, x, y, self.fill_tolerance, color, brush.opacity)
-                {
+                if let Some(fill) = canvas::flood_fill(layer, x, y, self.fill_tolerance, mode) {
                     self.history.push(Action::Tiles {
                         layer_id: layer.id,
                         tiles: fill.tiles,
@@ -1393,7 +1418,12 @@ impl PaintApp {
             return;
         }
         self.preview.tiles.clear();
-        let mut op = PaintOp::new(self.preview.id, self.paint_mode());
+        let [r, g, b, a] = self.preview_color().to_srgba_unmultiplied();
+        let preview_mode = PaintMode::Paint {
+            color: [r, g, b, 255],
+            opacity: a as f32 / 255.0,
+        };
+        let mut op = PaintOp::new(self.preview.id, preview_mode);
         match &key {
             Some(PreviewKey::Ellipse {
                 rect: r,
@@ -1525,7 +1555,7 @@ impl PaintApp {
 
         let outline = Stroke::new(1.0, Color32::from_gray(120));
         let pointer = ui.input(|i| i.pointer.latest_pos());
-        let color = self.color.gamma_multiply(self.brush().opacity);
+        let color = self.preview_color();
         let pen = Stroke::new(self.brush().size * self.scale(), color);
         // Rectangle preview, and the size of whatever rectangle is being dragged.
         if let Some(pos) = pointer {

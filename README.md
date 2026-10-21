@@ -13,7 +13,8 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
   White is treated as transparent when pasting (toggleable).
-- **Color picker** in the top bar plus a quick palette.
+- **Color picker** in the top bar plus a quick palette. The last swatch is **Clear**:
+  with it, Fill (and Brush, shapes, Text) erase instead of painting.
 - **Floating size and opacity sliders** on the left side of the canvas. Painting tools
   share one size/opacity; the eraser and the text tool each keep their own.
 - **Quick brush resize** – hold Alt (Option on macOS) and drag left/right or scroll;
@@ -64,7 +65,8 @@ Flood fill works on the active layer. Filling an enclosed area paints it. Fillin
 area that is open to infinity (e.g. around a drawn shape) changes the layer's
 background color everywhere, out to infinity, while enclosed areas keep their look:
 draw a circle, fill outside it with red, and the inside stays white. Undo restores
-the previous background.
+the previous background. Filling with the Clear color erases the area instead; on
+the open area it makes the infinite background clear again.
 
 ## Build & run
 

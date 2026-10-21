@@ -188,7 +188,17 @@ mod tests {
     fn undo_background_fill() {
         let mut layers = vec![Layer::new(1, "a")];
         let mut h = History::new(10);
-        let r = crate::canvas::flood_fill(&mut layers[0], 0, 0, 0, [1, 2, 3, 255], 1.0).unwrap();
+        let r = crate::canvas::flood_fill(
+            &mut layers[0],
+            0,
+            0,
+            0,
+            PaintMode::Paint {
+                color: [1, 2, 3, 255],
+                opacity: 1.0,
+            },
+        )
+        .unwrap();
         h.push(Action::Tiles {
             layer_id: 1,
             tiles: r.tiles,
