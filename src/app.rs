@@ -10,6 +10,7 @@ use crate::canvas::{self, IRect, Image, Layer, LayerId, PaintMode, PaintOp, TILE
 use crate::history::{Action, History};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
+use crate::text::{self, FontFace, TextStyle};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
@@ -20,18 +21,53 @@ enum Tool {
     Ellipse,
     Grid,
     Select,
+    Text,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, Key, Icon); 7] = [
+    const ALL: [(Tool, &'static str, Key, Icon); 8] = [
         (Tool::Brush, "Brush", Key::B, Icon::Brush),
         (Tool::Eraser, "Eraser", Key::E, Icon::Eraser),
         (Tool::Fill, "Fill", Key::G, Icon::Fill),
         (Tool::Rectangle, "Rectangle", Key::R, Icon::Rectangle),
         (Tool::Ellipse, "Ellipse", Key::C, Icon::Ellipse),
-        (Tool::Grid, "Grid", Key::T, Icon::Grid),
+        (Tool::Grid, "Grid", Key::H, Icon::Grid),
         (Tool::Select, "Select", Key::M, Icon::Select),
+        (Tool::Text, "Text", Key::T, Icon::Text),
     ];
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Brush {
+    /// Pen width, or font size for text, in canvas pixels.
+    size: f32,
+    opacity: f32,
+}
+
+/// Text being typed with the Text tool, not yet placed onto the layer.
+struct TextEdit {
+    /// Top-left corner of the first line.
+    origin: [i32; 2],
+    buffer: text::Buffer,
+}
+
+/// What the preview layer currently shows.
+#[derive(Clone, Debug, PartialEq)]
+enum PreviewKey {
+    Ellipse {
+        rect: IRect,
+        size: f32,
+        filled: bool,
+        color: [u8; 4],
+        opacity: f32,
+    },
+    Text {
+        origin: [i32; 2],
+        text: String,
+        style: TextStyle,
+        color: [u8; 4],
+        opacity: f32,
+    },
 }
 
 /// Progress of the click-by-click grid tool.
@@ -161,8 +197,10 @@ pub struct PaintApp {
 
     tool: Tool,
     color: Color32,
-    size: f32,
-    opacity: f32,
+    /// Size and opacity, kept separately for painting tools, the eraser and text.
+    paint_brush: Brush,
+    eraser_brush: Brush,
+    text_brush: Brush,
     fill_tolerance: u8,
     fill_shapes: bool,
 
@@ -171,6 +209,8 @@ pub struct PaintApp {
 
     selection: Option<IRect>,
     floating: Option<Floating>,
+    text_edit: Option<TextEdit>,
+    text_face: FontFace,
     grid: Option<GridState>,
     /// Last copied image, used if the system clipboard can't be read.
     clipboard: Option<Image>,
@@ -196,7 +236,7 @@ pub struct PaintApp {
     preview: Layer,
     preview_textures: HashMap<TileKey, TextureHandle>,
     /// Inputs of the current preview, to skip re-rendering when unchanged.
-    preview_key: Option<(IRect, f32, bool, [u8; 4], f32)>,
+    preview_key: Option<PreviewKey>,
 
     thumbs: HashMap<LayerId, TextureHandle>,
     /// Tight bounds of the painted pixels in each tile, for framing thumbnails.
@@ -218,14 +258,26 @@ impl PaintApp {
             history: History::new(200),
             tool: Tool::Brush,
             color: Color32::BLACK,
-            size: 8.0,
-            opacity: 1.0,
+            paint_brush: Brush {
+                size: 8.0,
+                opacity: 1.0,
+            },
+            eraser_brush: Brush {
+                size: 24.0,
+                opacity: 1.0,
+            },
+            text_brush: Brush {
+                size: 32.0,
+                opacity: 1.0,
+            },
             fill_tolerance: 32,
             fill_shapes: false,
             settings,
             settings_open: false,
             selection: None,
             floating: None,
+            text_edit: None,
+            text_face: FontFace::Sans,
             grid: None,
             clipboard: None,
             offset: Vec2::ZERO,
@@ -254,6 +306,9 @@ impl eframe::App for PaintApp {
         if self.tool != Tool::Grid {
             self.grid = None;
         }
+        if self.tool != Tool::Text {
+            self.commit_text();
+        }
         self.shortcuts(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
@@ -274,6 +329,10 @@ impl PaintApp {
     }
 
     fn undo(&mut self) {
+        // Undoing while typing drops the text that isn't placed yet.
+        if self.text_edit.take().is_some() {
+            return;
+        }
         // Undoing right after a paste just drops the pasted image.
         if self.floating.take().is_some() {
             return;
@@ -298,6 +357,11 @@ impl PaintApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        if self.text_edit.is_some() {
+            // While typing, the keyboard belongs to the text.
+            self.text_keys(ctx);
             return;
         }
         let redo_a = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
@@ -366,6 +430,67 @@ impl PaintApp {
                 _ => {}
             }
         }
+    }
+
+    fn text_keys(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|i| i.events.clone());
+        for event in events {
+            let Some(edit) = &mut self.text_edit else {
+                return;
+            };
+            let b = &mut edit.buffer;
+            match event {
+                egui::Event::Text(s) | egui::Event::Paste(s) => {
+                    let s: String = s
+                        .chars()
+                        .filter(|c| !c.is_control() || *c == '\n')
+                        .collect();
+                    b.insert(&s);
+                }
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => match key {
+                    Key::Enter => b.insert("\n"),
+                    Key::Tab => b.insert("    "),
+                    Key::Backspace => b.backspace(),
+                    Key::Delete => b.delete(),
+                    Key::ArrowLeft => b.left(),
+                    Key::ArrowRight => b.right(),
+                    Key::ArrowUp => b.vertical(false),
+                    Key::ArrowDown => b.vertical(true),
+                    Key::Home => b.home(),
+                    Key::End => b.end(),
+                    Key::Escape => self.commit_text(),
+                    Key::Z if modifiers.command => self.text_edit = None,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    /// Places the text being typed onto the active layer.
+    fn commit_text(&mut self) {
+        let Some(edit) = self.text_edit.take() else {
+            return;
+        };
+        let style = self.text_style();
+        let mode = PaintMode::Paint {
+            color: self.color.to_array(),
+            opacity: self.text_brush.opacity,
+        };
+        let mut op = PaintOp::new(self.active_layer_id(), mode);
+        draw_text(
+            &mut op,
+            &mut self.layers[self.active],
+            edit.origin,
+            style,
+            &edit.buffer.text,
+        );
+        self.commit(op);
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -466,23 +591,28 @@ impl PaintApp {
                 ui.set_width(64.0);
                 // The slider's built-in value box would pull it to the left, so
                 // the value gets its own box below the slider.
+                let brush = match self.tool {
+                    Tool::Eraser => &mut self.eraser_brush,
+                    Tool::Text => &mut self.text_brush,
+                    _ => &mut self.paint_brush,
+                };
                 ui.vertical_centered(|ui| {
                     ui.label("Size");
                     centered_slider(
                         ui,
-                        egui::Slider::new(&mut self.size, MIN_SIZE..=MAX_SIZE)
+                        egui::Slider::new(&mut brush.size, MIN_SIZE..=MAX_SIZE)
                             .vertical()
                             .logarithmic(true)
                             .show_value(false),
                     );
                     ui.add(
-                        egui::DragValue::new(&mut self.size)
+                        egui::DragValue::new(&mut brush.size)
                             .range(MIN_SIZE..=MAX_SIZE)
                             .max_decimals(0),
                     );
                     ui.add_space(8.0);
                     ui.label("Opacity");
-                    let mut pct = self.opacity * 100.0;
+                    let mut pct = brush.opacity * 100.0;
                     centered_slider(
                         ui,
                         egui::Slider::new(&mut pct, 1.0..=100.0)
@@ -495,7 +625,7 @@ impl PaintApp {
                             .max_decimals(0)
                             .suffix("%"),
                     );
-                    self.opacity = pct / 100.0;
+                    brush.opacity = pct / 100.0;
                 });
                 match self.tool {
                     Tool::Fill => {
@@ -506,6 +636,18 @@ impl PaintApp {
                     Tool::Ellipse | Tool::Rectangle => {
                         ui.separator();
                         ui.checkbox(&mut self.fill_shapes, "Filled");
+                    }
+                    Tool::Text => {
+                        ui.separator();
+                        ui.label("Font");
+                        egui::ComboBox::from_id_salt("font")
+                            .width(52.0)
+                            .selected_text(self.text_face.label())
+                            .show_ui(ui, |ui| {
+                                for f in FontFace::ALL {
+                                    ui.selectable_value(&mut self.text_face, f, f.label());
+                                }
+                            });
                     }
                     Tool::Grid => {
                         ui.separator();
@@ -758,6 +900,30 @@ impl PaintApp {
         }
     }
 
+    /// Size and opacity for the current tool.
+    fn brush(&self) -> Brush {
+        match self.tool {
+            Tool::Eraser => self.eraser_brush,
+            Tool::Text => self.text_brush,
+            _ => self.paint_brush,
+        }
+    }
+
+    fn brush_mut(&mut self) -> &mut Brush {
+        match self.tool {
+            Tool::Eraser => &mut self.eraser_brush,
+            Tool::Text => &mut self.text_brush,
+            _ => &mut self.paint_brush,
+        }
+    }
+
+    fn text_style(&self) -> TextStyle {
+        TextStyle {
+            face: self.text_face,
+            size: self.text_brush.size,
+        }
+    }
+
     fn square_held(&self) -> bool {
         self.settings.square_modifier.is_held(self.modifiers)
     }
@@ -815,7 +981,8 @@ impl PaintApp {
         let s = &self.settings;
         if s.resize_with_wheel && s.resize_modifier.is_held(mods) {
             let f = factor.powf(s.resize_sensitivity);
-            self.size = (self.size * f).clamp(MIN_SIZE, MAX_SIZE);
+            let brush = self.brush_mut();
+            brush.size = (brush.size * f).clamp(MIN_SIZE, MAX_SIZE);
             return;
         }
         let anchor = pointer.unwrap_or(rect.center());
@@ -856,7 +1023,7 @@ impl PaintApp {
                         PointerButton::Middle => Some(Gesture::Pan { button, last: pos }),
                         PointerButton::Primary if resize => Some(Gesture::Resize {
                             anchor: pos,
-                            start_size: self.size,
+                            start_size: self.brush().size,
                         }),
                         PointerButton::Primary if space => Some(Gesture::Pan { button, last: pos }),
                         PointerButton::Primary => {
@@ -897,6 +1064,8 @@ impl PaintApp {
     fn pointer_moved(&mut self, rect: Rect, pos: Pos2) {
         let p = self.to_canvas(rect, pos);
         let scale = self.scale();
+        let size = self.brush().size;
+        let mut resized = None;
         let select_end = match &self.gesture {
             Some(Gesture::Select { start }) => Some(self.rect_end(*start, p)),
             _ => None,
@@ -908,7 +1077,7 @@ impl PaintApp {
             }
             Some(Gesture::Stroke { op, last }) if p != *last => {
                 if let Some(layer) = self.layers.iter_mut().find(|l| l.id == op.layer_id) {
-                    op.stroke_segment(layer, *last, p, self.size / 2.0);
+                    op.stroke_segment(layer, *last, p, size / 2.0);
                 }
                 *last = p;
             }
@@ -925,25 +1094,29 @@ impl PaintApp {
             Some(Gesture::Resize { anchor, start_size }) => {
                 // Doubles/halves the size every 100 px of horizontal movement.
                 let dx = (pos.x - anchor.x) / 100.0 * self.settings.resize_sensitivity;
-                self.size = (*start_size * dx.exp2()).clamp(MIN_SIZE, MAX_SIZE);
+                resized = Some((*start_size * dx.exp2()).clamp(MIN_SIZE, MAX_SIZE));
             }
             _ => {}
+        }
+        if let Some(size) = resized {
+            self.brush_mut().size = size;
         }
     }
 
     fn paint_mode(&self) -> PaintMode {
         match self.tool {
             Tool::Eraser => PaintMode::Erase {
-                strength: self.opacity,
+                strength: self.brush().opacity,
             },
             _ => PaintMode::Paint {
                 color: self.color.to_array(),
-                opacity: self.opacity,
+                opacity: self.brush().opacity,
             },
         }
     }
 
     fn begin_tool(&mut self, rect: Rect, pos: Pos2) {
+        let brush = self.brush();
         let p = self.to_canvas(rect, pos);
         if let Some(f) = &self.floating {
             let (x, y) = (p[0].floor() as i32, p[1].floor() as i32);
@@ -969,7 +1142,7 @@ impl PaintApp {
         match self.tool {
             Tool::Brush | Tool::Eraser => {
                 let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
-                op.stroke_segment(&mut self.layers[self.active], p, p, self.size / 2.0);
+                op.stroke_segment(&mut self.layers[self.active], p, p, brush.size / 2.0);
                 self.gesture = Some(Gesture::Stroke { op, last: p });
             }
             Tool::Ellipse => {
@@ -981,12 +1154,20 @@ impl PaintApp {
                 self.gesture = Some(Gesture::Rectangle { start });
             }
             Tool::Grid => self.grid_click(p),
+            Tool::Text => {
+                // A click finishes any text being typed and starts new text there.
+                self.commit_text();
+                self.text_edit = Some(TextEdit {
+                    origin: [p[0].round() as i32, p[1].round() as i32],
+                    buffer: text::Buffer::default(),
+                });
+            }
             Tool::Fill => {
                 let layer = &mut self.layers[self.active];
                 let (x, y) = (p[0].floor() as i32, p[1].floor() as i32);
                 let color = self.color.to_array();
                 if let Some(fill) =
-                    canvas::flood_fill(layer, x, y, self.fill_tolerance, color, self.opacity)
+                    canvas::flood_fill(layer, x, y, self.fill_tolerance, color, brush.opacity)
                 {
                     self.history.push(Action::Tiles {
                         layer_id: layer.id,
@@ -1001,6 +1182,7 @@ impl PaintApp {
 
     /// Advances the grid tool: start the cell, fix the cell, then draw the grid.
     fn grid_click(&mut self, p: [f32; 2]) {
+        let brush = self.brush();
         self.grid = match self.grid {
             None => Some(GridState::Cell {
                 origin: [p[0].round() as i32, p[1].round() as i32],
@@ -1027,7 +1209,7 @@ impl PaintApp {
                     cell,
                     cols,
                     rows,
-                    self.size,
+                    brush.size,
                 );
                 self.commit(op);
                 None
@@ -1043,6 +1225,7 @@ impl PaintApp {
     }
 
     fn finish_gesture_at(&mut self, rect: Rect, pos: Option<Pos2>) {
+        let brush = self.brush();
         match self.gesture.take() {
             Some(Gesture::Stroke { op, .. }) => self.commit(op),
             Some(Gesture::Ellipse { start }) => {
@@ -1056,7 +1239,7 @@ impl PaintApp {
                 op.ellipse(
                     &mut self.layers[self.active],
                     r,
-                    self.size,
+                    brush.size,
                     self.fill_shapes,
                 );
                 self.commit(op);
@@ -1072,7 +1255,7 @@ impl PaintApp {
                 op.rectangle(
                     &mut self.layers[self.active],
                     r,
-                    self.size,
+                    brush.size,
                     self.fill_shapes,
                 );
                 self.commit(op);
@@ -1175,32 +1358,49 @@ impl PaintApp {
     /// Renders the ellipse being dragged out into the preview layer.
     fn update_preview(&mut self, ui: &egui::Ui, rect: Rect) {
         let pointer = ui.input(|i| i.pointer.latest_pos());
-        let key = match (&self.gesture, pointer) {
-            (Some(Gesture::Ellipse { start }), Some(pos)) => {
+        let key = match (&self.gesture, pointer, &self.text_edit) {
+            (Some(Gesture::Ellipse { start }), Some(pos), _) => {
                 let end = self.rect_end(*start, self.to_canvas(rect, pos));
-                let r = canvas::rect_from_corners(*start, end);
-                Some((
-                    r,
-                    self.size,
-                    self.fill_shapes,
-                    self.color.to_array(),
-                    self.opacity,
-                ))
+                Some(PreviewKey::Ellipse {
+                    rect: canvas::rect_from_corners(*start, end),
+                    size: self.brush().size,
+                    filled: self.fill_shapes,
+                    color: self.color.to_array(),
+                    opacity: self.brush().opacity,
+                })
             }
+            (_, _, Some(edit)) => Some(PreviewKey::Text {
+                origin: edit.origin,
+                text: edit.buffer.text.clone(),
+                style: self.text_style(),
+                color: self.color.to_array(),
+                opacity: self.brush().opacity,
+            }),
             _ => None,
         };
         if key == self.preview_key {
             return;
         }
-        self.preview_key = key;
         self.preview.tiles.clear();
-        if let Some((r, size, filled, _, _)) = key
-            && r.width() > 0
-            && r.height() > 0
-        {
-            let mut op = PaintOp::new(self.preview.id, self.paint_mode());
-            op.ellipse(&mut self.preview, r, size, filled);
+        let mut op = PaintOp::new(self.preview.id, self.paint_mode());
+        match &key {
+            Some(PreviewKey::Ellipse {
+                rect: r,
+                size,
+                filled,
+                ..
+            }) if r.width() > 0 && r.height() > 0 => {
+                op.ellipse(&mut self.preview, *r, *size, *filled);
+            }
+            Some(PreviewKey::Text {
+                origin,
+                text,
+                style,
+                ..
+            }) => draw_text(&mut op, &mut self.preview, *origin, *style, text),
+            _ => {}
         }
+        self.preview_key = key;
         self.preview.dirty.clear();
         let ctx = ui.ctx();
         self.preview_textures
@@ -1314,8 +1514,8 @@ impl PaintApp {
 
         let outline = Stroke::new(1.0, Color32::from_gray(120));
         let pointer = ui.input(|i| i.pointer.latest_pos());
-        let color = self.color.gamma_multiply(self.opacity);
-        let pen = Stroke::new(self.size * self.scale(), color);
+        let color = self.color.gamma_multiply(self.brush().opacity);
+        let pen = Stroke::new(self.brush().size * self.scale(), color);
         // Rectangle preview, and the size of whatever rectangle is being dragged.
         if let Some(pos) = pointer {
             let p = self.to_canvas(rect, pos);
@@ -1341,6 +1541,18 @@ impl PaintApp {
                 }
                 _ => {}
             }
+        }
+
+        // Text caret.
+        if let Some(edit) = &self.text_edit {
+            let style = self.text_style();
+            let (line, before) = edit.buffer.caret_line();
+            let x = edit.origin[0] as f32 + style.advance(before);
+            let y = edit.origin[1] as f32 + line as f32 * style.line_height();
+            let top = self.to_screen(rect, [x, y]);
+            let bottom = self.to_screen(rect, [x, y + style.caret_height()]);
+            painter.line_segment([top, bottom], Stroke::new(3.0, Color32::WHITE));
+            painter.line_segment([top, bottom], Stroke::new(1.5, Color32::BLACK));
         }
 
         // Grid preview.
@@ -1377,13 +1589,13 @@ impl PaintApp {
 
         // While resizing, show the brush at the spot where the drag started.
         if let Some(Gesture::Resize { anchor, .. }) = &self.gesture {
-            let r = (self.size / 2.0 * self.scale()).max(1.0);
+            let r = (self.brush().size / 2.0 * self.scale()).max(1.0);
             painter.circle_stroke(*anchor, r, Stroke::new(2.0, Color32::WHITE));
             painter.circle_stroke(*anchor, r, Stroke::new(1.0, Color32::BLACK));
             painter.text(
                 *anchor + Vec2::new(r + 8.0, 0.0),
                 Align2::LEFT_CENTER,
-                format!("{:.0} px", self.size),
+                format!("{:.0} px", self.brush().size),
                 egui::FontId::proportional(14.0),
                 Color32::BLACK,
             );
@@ -1404,8 +1616,13 @@ impl PaintApp {
             }
             match self.tool {
                 Tool::Brush | Tool::Eraser => {
-                    painter.circle_stroke(pos, (self.size / 2.0 * self.scale()).max(1.0), outline);
+                    painter.circle_stroke(
+                        pos,
+                        (self.brush().size / 2.0 * self.scale()).max(1.0),
+                        outline,
+                    );
                 }
+                Tool::Text => ui.ctx().set_cursor_icon(CursorIcon::Text),
                 Tool::Ellipse | Tool::Fill | Tool::Select | Tool::Rectangle | Tool::Grid => {
                     painter.line_segment([pos - Vec2::X * 6.0, pos + Vec2::X * 6.0], outline);
                     painter.line_segment([pos - Vec2::Y * 6.0, pos + Vec2::Y * 6.0], outline);
@@ -1509,6 +1726,23 @@ fn centered_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egui::Respons
         ui.add(slider)
     })
     .inner
+}
+
+/// Renders `text` with its first line's top-left corner at `origin`.
+fn draw_text(op: &mut PaintOp, layer: &mut Layer, origin: [i32; 2], style: TextStyle, text: &str) {
+    let Some(mask) = text::render(style, text) else {
+        return;
+    };
+    let (ox, oy) = (origin[0], origin[1]);
+    let area = IRect {
+        x0: ox + mask.x,
+        y0: oy + mask.y,
+        x1: ox + mask.x + mask.width as i32,
+        y1: oy + mask.y + mask.height as i32,
+    };
+    op.apply(layer, area, |fx, fy| {
+        mask.at(fx.floor() as i32 - ox, fy.floor() as i32 - oy)
+    });
 }
 
 /// Draws a small text label with a background next to the pointer.

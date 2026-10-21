@@ -6,7 +6,9 @@ rust-version = "1.95"
 edition = "2024"
 
 [dependencies]
+ab_glyph = "0.2"
 arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+dejavu = "2.37"
 eframe = { version = "0.37", features = ["persistence"] }
 serde = { version = "1", features = ["derive"] }
 
