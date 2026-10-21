@@ -113,9 +113,10 @@ enum Gesture {
 struct Floating {
     /// The image as pasted.
     original: Image,
-    /// What will be placed: `original`, possibly with white made transparent.
+    /// What will be placed: `original`, possibly with one color keyed out.
     image: Image,
-    white_transparent: bool,
+    /// The color made transparent, if any.
+    transparent: Option<[u8; 3]>,
     x: i32,
     y: i32,
     /// GPU textures for `image`, split so no texture exceeds GPU limits.
@@ -123,28 +124,27 @@ struct Floating {
 }
 
 impl Floating {
-    fn new(original: Image, x: i32, y: i32, white_transparent: bool) -> Self {
+    fn new(original: Image, x: i32, y: i32, transparent: Option<[u8; 3]>) -> Self {
         let mut f = Self {
             image: original.clone(),
             original,
-            white_transparent: false,
+            transparent: None,
             x,
             y,
             chunks: Vec::new(),
         };
-        f.set_white_transparent(white_transparent);
+        f.set_transparent(transparent);
         f
     }
 
-    fn set_white_transparent(&mut self, on: bool) {
-        if on == self.white_transparent {
+    fn set_transparent(&mut self, key: Option<[u8; 3]>) {
+        if key == self.transparent {
             return;
         }
-        self.white_transparent = on;
-        self.image = if on {
-            canvas::white_to_transparent(&self.original)
-        } else {
-            self.original.clone()
+        self.transparent = key;
+        self.image = match key {
+            Some(key) => canvas::color_to_transparent(&self.original, key),
+            None => self.original.clone(),
         };
         self.chunks.clear();
     }
@@ -740,8 +740,11 @@ impl PaintApp {
                 }
                 if self.floating.is_some() {
                     ui.separator();
-                    ui.checkbox(&mut self.settings.paste_white_transparent, "White → clear")
-                        .on_hover_text("Treat white pixels of the pasted image as transparent");
+                    ui.checkbox(
+                        &mut self.settings.paste_secondary_transparent,
+                        "Color 2 → clear",
+                    )
+                    .on_hover_text("Treat pixels of color 2 in the pasted image as transparent");
                     ui.vertical_centered_justified(|ui| {
                         if ui.button("Place").on_hover_text("Enter").clicked() {
                             self.place_floating();
@@ -909,8 +912,8 @@ impl PaintApp {
         let center = self.to_canvas(rect, self.canvas_hover.unwrap_or(rect.center()));
         let x = (center[0] - image.width as f32 / 2.0).round() as i32;
         let y = (center[1] - image.height as f32 / 2.0).round() as i32;
-        let white = self.settings.paste_white_transparent;
-        self.floating = Some(Floating::new(image, x, y, white));
+        let key = self.paste_transparent_color();
+        self.floating = Some(Floating::new(image, x, y, key));
         self.selection = None;
     }
 
@@ -1190,6 +1193,12 @@ impl PaintApp {
         }
     }
 
+    /// The color keyed out of pasted images: color 2, if enabled and not Clear.
+    fn paste_transparent_color(&self) -> Option<[u8; 3]> {
+        let [r, g, b, a] = self.secondary.to_array();
+        (self.settings.paste_secondary_transparent && a > 0).then_some([r, g, b])
+    }
+
     /// The color for the current click: color 2 after a right click.
     fn color(&self) -> Color32 {
         if self.use_secondary {
@@ -1461,8 +1470,10 @@ impl PaintApp {
             ctx.request_repaint();
         }
 
+        let key = self.paste_transparent_color();
         if let Some(f) = &mut self.floating {
-            f.set_white_transparent(self.settings.paste_white_transparent);
+            // Follows the setting and color 2 live while the paste is floating.
+            f.set_transparent(key);
             if f.chunks.is_empty() {
                 f.chunks = image_chunks(ctx, &f.image);
             }

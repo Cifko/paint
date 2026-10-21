@@ -448,12 +448,12 @@ pub struct Image {
     pub pixels: Vec<Rgba>,
 }
 
-/// Returns a copy of `image` with pure white pixels made transparent.
-pub fn white_to_transparent(image: &Image) -> Image {
+/// Returns a copy of `image` with every pixel of color `key` made transparent.
+pub fn color_to_transparent(image: &Image, key: [u8; 3]) -> Image {
     let pixels = image
         .pixels
         .iter()
-        .map(|&p| if p[..3] == [255, 255, 255] { [0; 4] } else { p })
+        .map(|&p| if p[..3] == key { [0; 4] } else { p })
         .collect();
     Image {
         width: image.width,
@@ -1163,14 +1163,17 @@ mod tests {
     }
 
     #[test]
-    fn white_becomes_transparent() {
+    fn key_color_becomes_transparent() {
         let img = Image {
-            width: 2,
+            width: 3,
             height: 1,
-            pixels: vec![[255, 255, 255, 255], [250, 255, 255, 255]],
+            pixels: vec![[255, 255, 255, 255], [250, 255, 255, 255], [0, 128, 0, 255]],
         };
-        let out = white_to_transparent(&img);
-        assert_eq!(out.pixels, vec![[0; 4], [250, 255, 255, 255]]);
+        let out = color_to_transparent(&img, [255, 255, 255]);
+        assert_eq!(out.pixels[..2], [[0; 4], [250, 255, 255, 255]]);
+        let out = color_to_transparent(&img, [0, 128, 0]);
+        assert_eq!(out.pixels[2], [0; 4]);
+        assert_eq!(out.pixels[0], [255, 255, 255, 255]);
     }
 
     #[test]
