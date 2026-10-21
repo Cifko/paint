@@ -544,15 +544,18 @@ pub enum ShapeKind {
     Rectangle,
     Ellipse,
     Triangle,
+    /// A regular polygon with a chosen number of sides.
+    NGon,
     Line,
     Polyline,
 }
 
 impl ShapeKind {
-    pub const ALL: [ShapeKind; 5] = [
+    pub const ALL: [ShapeKind; 6] = [
         Self::Rectangle,
         Self::Ellipse,
         Self::Triangle,
+        Self::NGon,
         Self::Line,
         Self::Polyline,
     ];
@@ -562,6 +565,7 @@ impl ShapeKind {
             Self::Rectangle => "Rectangle",
             Self::Ellipse => "Ellipse",
             Self::Triangle => "Triangle",
+            Self::NGon => "N-gon",
             Self::Line => "Line",
             Self::Polyline => "Polyline",
         }
@@ -569,14 +573,21 @@ impl ShapeKind {
 
     /// Whether the shape is drawn by dragging out a bounding box.
     pub fn is_boxed(self) -> bool {
-        matches!(self, Self::Rectangle | Self::Ellipse | Self::Triangle)
+        matches!(
+            self,
+            Self::Rectangle | Self::Ellipse | Self::Triangle | Self::NGon
+        )
     }
 
     /// Height / width when snapped to a regular shape (square, circle,
-    /// equilateral triangle).
-    pub fn regular_ratio(self) -> f32 {
+    /// equilateral triangle, an n-gon's own proportions for `sides`).
+    pub fn regular_ratio(self, sides: u32) -> f32 {
         match self {
             Self::Triangle => 3f32.sqrt() / 2.0,
+            Self::NGon => {
+                let [w, h] = ngon_size(sides);
+                h / w
+            }
             _ => 1.0,
         }
     }
@@ -590,6 +601,48 @@ pub fn triangle_points(r: IRect) -> [[f32; 2]; 3] {
         [r.x1 as f32, r.y1 as f32],
         [r.x0 as f32, r.y1 as f32],
     ]
+}
+
+/// Corners of a regular `sides`-gon on the unit circle, with a flat edge at
+/// the bottom (so 4 gives a square, 6 a flat-topped hexagon).
+fn ngon_unit(sides: u32) -> Vec<[f32; 2]> {
+    let n = sides.max(3);
+    let step = std::f32::consts::TAU / n as f32;
+    // A corner straight down would leave no flat bottom; turn half a step.
+    let start = std::f32::consts::FRAC_PI_2 + if n.is_multiple_of(2) { step / 2.0 } else { 0.0 };
+    (0..n)
+        .map(|i| {
+            let a = start + i as f32 * step;
+            [a.cos(), -a.sin()]
+        })
+        .collect()
+}
+
+/// Width and height of the unit n-gon.
+fn ngon_size(sides: u32) -> [f32; 2] {
+    let pts = ngon_unit(sides);
+    let span = |i: usize| {
+        let (lo, hi) = pts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+            (lo.min(p[i]), hi.max(p[i]))
+        });
+        hi - lo
+    };
+    [span(0), span(1)]
+}
+
+/// Corners of the largest regular `sides`-gon fitting in `r`, centered in it.
+pub fn ngon_points(r: IRect, sides: u32) -> Vec<[f32; 2]> {
+    let unit = ngon_unit(sides);
+    let [uw, uh] = ngon_size(sides);
+    let scale = (r.width() as f32 / uw).min(r.height() as f32 / uh);
+    // Center the polygon's own bounding box in `r`.
+    let min_x = unit.iter().map(|p| p[0]).fold(f32::MAX, f32::min);
+    let min_y = unit.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
+    let x0 = (r.x0 + r.x1) as f32 / 2.0 - uw * scale / 2.0;
+    let y0 = (r.y0 + r.y1) as f32 / 2.0 - uh * scale / 2.0;
+    unit.iter()
+        .map(|p| [x0 + (p[0] - min_x) * scale, y0 + (p[1] - min_y) * scale])
+        .collect()
 }
 
 /// Moves `end` so the line from `start` points in a multiple of 45°.
@@ -1736,5 +1789,55 @@ mod tests {
         assert!((s[0] - s[1]).abs() < 1e-3, "diagonal: {s:?}");
         let s = snap_angle([0.0, 0.0], [-3.0, -80.0]);
         assert!(s[0].abs() < 1e-3 && (s[1] + 80.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ngon_is_regular_and_fits() {
+        for n in [3u32, 4, 5, 6, 7, 12, 20] {
+            let r = IRect {
+                x0: 10,
+                y0: 20,
+                x1: 210,
+                y1: 120,
+            };
+            let pts = ngon_points(r, n);
+            assert_eq!(pts.len(), n as usize);
+            // All sides equal.
+            let side = |i: usize| {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                (a[0] - b[0]).hypot(a[1] - b[1])
+            };
+            for i in 1..pts.len() {
+                assert!((side(i) - side(0)).abs() < 0.01, "n={n}: uneven sides");
+            }
+            // Inside the box, touching it on two opposite sides.
+            for p in &pts {
+                assert!(
+                    p[0] >= 9.99 && p[0] <= 210.01 && p[1] >= 19.99 && p[1] <= 120.01,
+                    "n={n}: {p:?}"
+                );
+            }
+            // A flat bottom edge.
+            let max_y = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
+            assert_eq!(
+                pts.iter().filter(|p| (p[1] - max_y).abs() < 0.01).count(),
+                2,
+                "n={n}"
+            );
+        }
+        // A square for n = 4.
+        let sq = ngon_points(
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 100,
+                y1: 100,
+            },
+            4,
+        );
+        assert!(
+            sq.iter()
+                .all(|p| p[0].abs() < 0.01 || (p[0] - 100.0).abs() < 0.01)
+        );
     }
 }

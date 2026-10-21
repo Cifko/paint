@@ -11,8 +11,8 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 - **Open / save** PNG, JPEG and BMP (File menu, `Ctrl+O` / `Ctrl+S`, drag a file onto
   the window, or `paint image.png`). Saving flattens the visible layers and crops to
   what's drawn; PNG keeps transparency, JPEG/BMP get a white background.
-- **Tools** – Brush, Eraser, Flood fill, Shapes (rectangle, ellipse, triangle – outline
-  or filled – line and polyline),
+- **Tools** – Brush, Eraser, Flood fill, Shapes (rectangle, ellipse, triangle, regular
+  n-gon – outline or filled – line and polyline),
   Grid, rectangle Select, Text.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
@@ -39,7 +39,7 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | Zoom | Mouse wheel / pinch (around the cursor) |
 | Brush / Eraser / Fill | `B` / `E` / `G` |
 | Shape tool / Grid / Select / Text | `S` / `H` / `M` / `T` |
-| Rectangle / Ellipse / Line / Polyline | `R` / `C` / `L` / `P` |
+| Rectangle / Ellipse / N-gon / Line / Polyline | `R` / `C` / `N` / `L` / `P` |
 | Snap to square / circle / equilateral triangle, lines to 45° steps | Hold `Shift` while drawing (configurable) |
 | Select everything that's painted | `Ctrl+A` |
 | Change brush size | Hold `Alt` (`Option` on macOS) + drag left/right or scroll (configurable) |
@@ -57,8 +57,10 @@ elsewhere or switching tools places the text; `Ctrl+Z` while typing discards it.
 size slider sets the font size; the font is chosen in the side panel (DejaVu fonts,
 bundled).
 
-Shapes: pick one with the small arrow next to the shape button. Rectangle, ellipse and
-triangle: drag from corner to corner of the bounding box. Line: drag from end to end.
+Shapes and grids: hover the shape (or grid) button to pick a kind from its menu.
+Rectangle, ellipse, triangle and n-gon: drag from corner to corner of the bounding box.
+The n-gon is always regular (3–20 sides, set with the Sides slider), fitted into the box
+with a flat bottom edge. Line: drag from end to end.
 Polyline: click to add points, double-click or `Enter` to finish, click the first point
 to close it; `Ctrl+Z` removes the last point, `Esc` cancels. The pen size is the line
 width.
@@ -66,8 +68,8 @@ width.
 The selection belongs to the Select tool: it's only shown (and only used by copy, cut
 and delete) while that tool is active.
 
-Grid: pick the cell shape (rectangles, triangles or hexagons) with the small arrow next
-to the grid button, click where the grid starts, move the mouse to size one cell, click, then move
+Grid: pick the cell shape (rectangles, triangles or hexagons) from the grid button's
+menu, click where the grid starts, move the mouse to size one cell, click, then move
 to size the whole grid and click again. As many whole cells as fit are drawn (e.g. a
 3×7 cell in a 10×20 area gives 3×2 cells); the count is shown while you move. With
 `Shift` the cell becomes regular (square, equilateral triangle, regular hexagon).
