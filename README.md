@@ -61,8 +61,8 @@ size is the outline width.
 The selection belongs to the Select tool: it's only shown (and only used by copy, cut
 and delete) while that tool is active.
 
-Grid: pick the cell shape (rectangles, triangles or hexagons) in the toolbar next to
-the tools, click where the grid starts, move the mouse to size one cell, click, then move
+Grid: pick the cell shape (rectangles, triangles or hexagons) with the small arrow next
+to the grid button, click where the grid starts, move the mouse to size one cell, click, then move
 to size the whole grid and click again. As many whole cells as fit are drawn (e.g. a
 3×7 cell in a 10×20 area gives 3×2 cells); the count is shown while you move. With
 `Shift` the cell becomes regular (square, equilateral triangle, regular hexagon).
