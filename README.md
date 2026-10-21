@@ -13,8 +13,10 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
   White is treated as transparent when pasting (toggleable).
-- **Color picker** in the top bar plus a quick palette. The last swatch is **Clear**:
-  with it, Fill (and Brush, shapes, Text) erase instead of painting.
+- **Two colors, like MS Paint** – the left mouse button paints with color 1, the right
+  button with color 2. Left-click a palette swatch to set color 1, right-click to set
+  color 2; click either color in the toolbar for a full picker, `X` swaps them. The last
+  swatch is **Clear**: with it, Fill (and Brush, shapes, Text) erase instead of painting.
 - **Floating size and opacity sliders** on the left side of the canvas. Painting tools
   share one size/opacity; the eraser and the text tool each keep their own.
 - **Quick brush resize** – hold Alt (Option on macOS) and drag left/right or scroll;
@@ -26,7 +28,8 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 
 | Action | Input |
 | --- | --- |
-| Paint / use tool | Left mouse button |
+| Paint / use tool | Left mouse button (color 1), right mouse button (color 2) |
+| Swap color 1 and 2 | `X` |
 | Pan | Middle mouse drag, or Space + left drag |
 | Zoom | Mouse wheel / pinch (around the cursor) |
 | Brush / Eraser / Fill | `B` / `E` / `G` |
@@ -57,7 +60,7 @@ and delete) while that tool is active.
 Grid: click where the grid starts, move the mouse to size one cell, click, then move
 to size the whole grid and click again. As many whole cells as fit are drawn (e.g. a
 3×7 cell in a 10×20 area gives 3×2 cells); the count is shown while you move.
-`Esc` or right-click cancels.
+`Esc` cancels.
 
 Pasted images float above the active layer until placed; drag them to move.
 
