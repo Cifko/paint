@@ -10,6 +10,7 @@ pub enum Icon {
     Rectangle,
     Ellipse,
     Triangle,
+    NGon,
     Line,
     Polyline,
     Grid,
@@ -95,6 +96,16 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Triangle => {
             let pts = vec![p(0.5, 0.16), p(0.88, 0.82), p(0.12, 0.82)];
+            painter.add(Shape::closed_line(pts, thin));
+        }
+        Icon::NGon => {
+            // A pentagon with a flat bottom.
+            let pts: Vec<Pos2> = (0..5)
+                .map(|i| {
+                    let a = std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / 5.0;
+                    p(0.5 + 0.38 * a.cos(), 0.54 - 0.38 * a.sin())
+                })
+                .collect();
             painter.add(Shape::closed_line(pts, thin));
         }
         Icon::Line => {

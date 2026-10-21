@@ -94,9 +94,10 @@ enum PendingAction {
 }
 
 /// Shortcut keys that pick a shape (and the Shape tool).
-const SHAPE_KEYS: [(Key, ShapeKind); 4] = [
+const SHAPE_KEYS: [(Key, ShapeKind); 5] = [
     (Key::R, ShapeKind::Rectangle),
     (Key::C, ShapeKind::Ellipse),
+    (Key::N, ShapeKind::NGon),
     (Key::L, ShapeKind::Line),
     (Key::P, ShapeKind::Polyline),
 ];
@@ -110,7 +111,8 @@ struct Polyline {
 #[derive(Clone, Debug, PartialEq)]
 enum ShapeSpec {
     Ellipse(IRect, f32, bool),
-    Triangle(IRect, f32, bool),
+    /// A convex polygon (triangle, n-gon).
+    Polygon(Vec<[f32; 2]>, f32, bool),
     Polyline(Vec<[f32; 2]>, f32),
 }
 
@@ -122,11 +124,7 @@ impl ShapeSpec {
                     op.ellipse(layer, *r, *size, *filled);
                 }
             }
-            Self::Triangle(r, size, filled) => {
-                if r.width() > 0 && r.height() > 0 {
-                    op.polygon(layer, &canvas::triangle_points(*r), *size, *filled);
-                }
-            }
+            Self::Polygon(points, size, filled) => op.polygon(layer, points, *size, *filled),
             Self::Polyline(points, size) => op.polyline(layer, points, *size),
         }
     }
@@ -283,6 +281,8 @@ pub struct PaintApp {
     grid: Option<GridState>,
     grid_kind: GridKind,
     shape_kind: ShapeKind,
+    /// Number of sides of the n-gon shape.
+    ngon_sides: u32,
     polyline: Option<Polyline>,
 
     /// Where the image was last opened from / saved to.
@@ -371,6 +371,7 @@ impl PaintApp {
             grid: None,
             grid_kind: GridKind::Rectangle,
             shape_kind: ShapeKind::Rectangle,
+            ngon_sides: 6,
             polyline: None,
             file_path: None,
             saved_version: 0,
@@ -992,16 +993,23 @@ impl PaintApp {
                     Tool::Shape => shape_icon(self.shape_kind),
                     _ => icon,
                 };
-                if icon_button(ui, icon, self.tool == tool)
-                    .on_hover_text(format!("{name} ({})", key.name()))
-                    .clicked()
-                {
+                let title = format!("{name} ({})", key.name());
+                let button = icon_button(ui, icon, self.tool == tool);
+                // Tools with kinds show a menu on hover instead of a tooltip.
+                let has_menu = matches!(tool, Tool::Grid | Tool::Shape);
+                let button = if has_menu {
+                    button
+                } else {
+                    button.on_hover_text(&title)
+                };
+                if button.clicked() {
                     self.tool = tool;
                 }
                 if tool == Tool::Grid
-                    && let Some(kind) = kind_dropdown(
+                    && let Some(kind) = hover_menu(
                         ui,
-                        "Grid shape",
+                        &button,
+                        &title,
                         &GridKind::ALL,
                         self.grid_kind,
                         grid_icon,
@@ -1015,9 +1023,10 @@ impl PaintApp {
                     self.tool = Tool::Grid;
                 }
                 if tool == Tool::Shape
-                    && let Some(kind) = kind_dropdown(
+                    && let Some(kind) = hover_menu(
                         ui,
-                        "Shape",
+                        &button,
+                        &title,
                         &ShapeKind::ALL,
                         self.shape_kind,
                         shape_icon,
@@ -1159,6 +1168,17 @@ impl PaintApp {
                             .suffix("%"),
                     );
                     brush.opacity = pct / 100.0;
+                    if self.tool == Tool::Shape && self.shape_kind == ShapeKind::NGon {
+                        ui.add_space(8.0);
+                        ui.label("Sides");
+                        centered_slider(
+                            ui,
+                            egui::Slider::new(&mut self.ngon_sides, 3..=20)
+                                .vertical()
+                                .show_value(false),
+                        );
+                        ui.add(egui::DragValue::new(&mut self.ngon_sides).range(3..=20));
+                    }
                 });
                 match self.tool {
                     Tool::Fill => {
@@ -1476,7 +1496,7 @@ impl PaintApp {
     /// Corner of a rectangle, ellipse or triangle's box; with the snap key
     /// held it becomes a square, circle or equilateral triangle.
     fn shape_end(&self, origin: [i32; 2], p: [f32; 2]) -> [i32; 2] {
-        self.regular_end(origin, p, self.shape_kind.regular_ratio())
+        self.regular_end(origin, p, self.shape_kind.regular_ratio(self.ngon_sides))
     }
 
     /// The pixel corner under `p`; with the snap key held, moved so the box
@@ -1493,6 +1513,17 @@ impl PaintApp {
             origin[0] + (sign(dx) * w).round() as i32,
             origin[1] + (sign(dy) * w * ratio).round() as i32,
         ]
+    }
+
+    /// Corners of the triangle or n-gon filling `r`.
+    fn polygon_points(&self, r: IRect) -> Vec<[f32; 2]> {
+        if r.width() <= 0 || r.height() <= 0 {
+            return Vec::new();
+        }
+        match self.shape_kind {
+            ShapeKind::NGon => canvas::ngon_points(r, self.ngon_sides),
+            _ => canvas::triangle_points(r).to_vec(),
+        }
     }
 
     /// End of a line from `start`, snapped to 45° steps with the snap key.
@@ -1923,7 +1954,10 @@ impl PaintApp {
                     ShapeKind::Rectangle => op.rectangle(layer, r, brush.size, self.fill_shapes),
                     ShapeKind::Ellipse => op.ellipse(layer, r, brush.size, self.fill_shapes),
                     _ => {
-                        let pts = canvas::triangle_points(r);
+                        let pts = match self.shape_kind {
+                            ShapeKind::NGon => canvas::ngon_points(r, self.ngon_sides),
+                            _ => canvas::triangle_points(r).to_vec(),
+                        };
                         op.polygon(layer, &pts, brush.size, self.fill_shapes);
                     }
                 }
@@ -2063,7 +2097,7 @@ impl PaintApp {
                 let (size, filled) = (self.brush().size, self.fill_shapes);
                 let shape = match self.shape_kind {
                     ShapeKind::Ellipse => ShapeSpec::Ellipse(r, size, filled),
-                    _ => ShapeSpec::Triangle(r, size, filled),
+                    _ => ShapeSpec::Polygon(self.polygon_points(r), size, filled),
                 };
                 Some(self.shape_preview(shape))
             }
@@ -2467,24 +2501,26 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool) -> egui::Response 
     resp
 }
 
-/// The small arrow next to a tool button, opening a list of kinds (shapes,
-/// grid shapes). Returns the kind picked.
-fn kind_dropdown<K: Copy + PartialEq>(
+/// A list of kinds (shapes, grid shapes) for a tool button. It opens while
+/// the pointer is over the button or the small arrow next to it (or when the
+/// arrow is clicked, for touch screens) and stays open while the pointer is
+/// over the list. Returns the kind picked.
+fn hover_menu<K: Copy + PartialEq>(
     ui: &mut egui::Ui,
-    hover: &str,
+    button: &egui::Response,
+    title: &str,
     kinds: &[K],
     current: K,
     icon: fn(K) -> Icon,
     label: fn(K) -> &'static str,
 ) -> Option<K> {
-    let (rect, arrow) = ui.allocate_exact_size(Vec2::new(12.0, 28.0), Sense::click());
-    let arrow = arrow.on_hover_text(hover);
-    let color = if arrow.hovered() {
+    let (arrow_rect, arrow) = ui.allocate_exact_size(Vec2::new(12.0, 28.0), Sense::click());
+    let color = if arrow.hovered() || button.hovered() {
         ui.visuals().strong_text_color()
     } else {
         ui.visuals().text_color()
     };
-    let c = rect.center();
+    let c = arrow_rect.center();
     ui.painter().add(Shape::convex_polygon(
         vec![
             c + Vec2::new(-4.0, -2.0),
@@ -2494,35 +2530,64 @@ fn kind_dropdown<K: Copy + PartialEq>(
         color,
         Stroke::NONE,
     ));
+
+    let ctx = ui.ctx().clone();
+    let id = button.id.with("hover_menu");
+    let rect_id = id.with("rect");
+    let mut open = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let menu_rect = ctx.data(|d| d.get_temp::<Rect>(rect_id));
+    let anchor = button.rect.union(arrow_rect);
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let over = |r: Rect| pointer.is_some_and(|p| r.expand(4.0).contains(p));
+    if button.hovered() || arrow.hovered() || arrow.clicked() {
+        open = true;
+    } else if !over(anchor) && !(open && menu_rect.is_some_and(over)) {
+        open = false;
+    }
+
     let mut picked = None;
-    egui::Popup::menu(&arrow).show(|ui| {
-        for &kind in kinds {
-            let (row, resp) = ui.allocate_exact_size(Vec2::new(140.0, 26.0), Sense::click());
-            let visuals = ui.visuals();
-            if kind == current || resp.hovered() {
-                let fill = if kind == current {
-                    visuals.selection.bg_fill
-                } else {
-                    visuals.widgets.hovered.weak_bg_fill
-                };
-                ui.painter().rect_filled(row, 4.0, fill);
-            }
-            let text_color = visuals.text_color();
-            let icon_rect = Rect::from_min_size(row.min + Vec2::new(4.0, 3.0), Vec2::splat(20.0));
-            icons::paint(ui.painter(), icon_rect, icon(kind), text_color);
-            ui.painter().text(
-                row.left_center() + Vec2::new(30.0, 0.0),
-                Align2::LEFT_CENTER,
-                label(kind),
-                egui::FontId::proportional(14.0),
-                text_color,
-            );
-            if resp.clicked() {
-                picked = Some(kind);
-                ui.close();
-            }
-        }
-    });
+    if open {
+        let area = egui::Area::new(id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor.left_bottom())
+            .show(&ctx, |ui| {
+                egui::Frame::menu(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new(title).small().weak());
+                    for &kind in kinds {
+                        let (row, resp) =
+                            ui.allocate_exact_size(Vec2::new(140.0, 26.0), Sense::click());
+                        let visuals = ui.visuals();
+                        if kind == current || resp.hovered() {
+                            let fill = if kind == current {
+                                visuals.selection.bg_fill
+                            } else {
+                                visuals.widgets.hovered.weak_bg_fill
+                            };
+                            ui.painter().rect_filled(row, 4.0, fill);
+                        }
+                        let text_color = visuals.text_color();
+                        let icon_rect =
+                            Rect::from_min_size(row.min + Vec2::new(4.0, 3.0), Vec2::splat(20.0));
+                        icons::paint(ui.painter(), icon_rect, icon(kind), text_color);
+                        ui.painter().text(
+                            row.left_center() + Vec2::new(30.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            label(kind),
+                            egui::FontId::proportional(14.0),
+                            text_color,
+                        );
+                        if resp.clicked() {
+                            picked = Some(kind);
+                        }
+                    }
+                });
+            });
+        ctx.data_mut(|d| d.insert_temp(rect_id, area.response.rect));
+    }
+    if picked.is_some() {
+        open = false;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, open));
     picked
 }
 
@@ -2531,6 +2596,7 @@ fn shape_icon(kind: ShapeKind) -> Icon {
         ShapeKind::Rectangle => Icon::Rectangle,
         ShapeKind::Ellipse => Icon::Ellipse,
         ShapeKind::Triangle => Icon::Triangle,
+        ShapeKind::NGon => Icon::NGon,
         ShapeKind::Line => Icon::Line,
         ShapeKind::Polyline => Icon::Polyline,
     }
