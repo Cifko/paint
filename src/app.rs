@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, Key, KeyboardShortcut, Modifiers, PointerButton, Pos2, Rect,
-    Sense, Stroke, TextureFilter, TextureHandle, TextureOptions, TextureWrapMode, Vec2,
+    self, Align2, Color32, ColorImage, CursorIcon, Key, KeyboardShortcut, Modifiers, PointerButton,
+    Pos2, Rect, Sense, Shape, Stroke, TextureFilter, TextureHandle, TextureOptions,
+    TextureWrapMode, Vec2,
 };
 
-use crate::canvas::{self, IRect, Layer, LayerId, PaintMode, PaintOp, TILE, TileKey};
+use crate::canvas::{self, IRect, Image, Layer, LayerId, PaintMode, PaintOp, TILE, TileKey};
 use crate::history::{Action, History};
+use crate::settings::Settings;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
@@ -14,22 +16,64 @@ enum Tool {
     Eraser,
     Fill,
     Circle,
+    Select,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, Key); 4] = [
+    const ALL: [(Tool, &'static str, Key); 5] = [
         (Tool::Brush, "Brush", Key::B),
         (Tool::Eraser, "Eraser", Key::E),
         (Tool::Fill, "Fill", Key::G),
         (Tool::Circle, "Circle", Key::C),
+        (Tool::Select, "Select", Key::M),
     ];
 }
 
 /// An in-progress interaction with the canvas.
 enum Gesture {
-    Stroke { op: PaintOp, last: [f32; 2] },
-    Circle { center: [f32; 2] },
-    Pan { button: PointerButton, last: Pos2 },
+    Stroke {
+        op: PaintOp,
+        last: [f32; 2],
+    },
+    Circle {
+        center: [f32; 2],
+    },
+    Select {
+        start: [i32; 2],
+    },
+    /// Dragging the floating pasted image; `grab` is the pointer's offset from its corner.
+    MoveFloating {
+        grab: [f32; 2],
+    },
+    /// Changing the brush size with the resize modifier held.
+    Resize {
+        anchor: Pos2,
+        start_size: f32,
+    },
+    Pan {
+        button: PointerButton,
+        last: Pos2,
+    },
+}
+
+/// A pasted image that hasn't been placed onto a layer yet.
+struct Floating {
+    image: Image,
+    x: i32,
+    y: i32,
+    /// GPU textures for the image, split so no texture exceeds GPU limits.
+    chunks: Vec<(IRect, TextureHandle)>,
+}
+
+impl Floating {
+    fn rect(&self) -> IRect {
+        IRect {
+            x0: self.x,
+            y0: self.y,
+            x1: self.x + self.image.width as i32,
+            y1: self.y + self.image.height as i32,
+        }
+    }
 }
 
 const PALETTE: [Color32; 12] = [
@@ -54,6 +98,13 @@ const TEXTURE_OPTIONS: TextureOptions = TextureOptions {
     mipmap_mode: None,
 };
 
+const MIN_SIZE: f32 = 1.0;
+const MAX_SIZE: f32 = 300.0;
+/// Resolution of layer thumbnails in pixels.
+const THUMB: usize = 64;
+/// Max side of a floating-image texture chunk.
+const CHUNK: usize = 2048;
+
 pub struct PaintApp {
     layers: Vec<Layer>,
     /// Index into `layers` (0 = bottom).
@@ -68,16 +119,38 @@ pub struct PaintApp {
     fill_tolerance: u8,
     fill_shapes: bool,
 
+    settings: Settings,
+    settings_open: bool,
+
+    selection: Option<IRect>,
+    floating: Option<Floating>,
+    /// Last copied image, used if the system clipboard can't be read.
+    clipboard: Option<Image>,
+
     /// Canvas coordinate shown at the top-left corner of the canvas area.
     offset: Vec2,
     zoom: f32,
+    /// Screen area of the canvas during the last frame.
+    canvas_rect: Rect,
+    /// Pointer position if it was over the canvas during the last frame.
+    canvas_hover: Option<Pos2>,
 
     gesture: Option<Gesture>,
     textures: HashMap<(LayerId, TileKey), TextureHandle>,
+
+    thumbs: HashMap<LayerId, TextureHandle>,
+    /// Tight bounds of the painted pixels in each tile, for framing thumbnails.
+    content_bounds: HashMap<(LayerId, TileKey), IRect>,
+    thumbs_dirty: bool,
+    thumbs_updated_at: f64,
 }
 
-impl Default for PaintApp {
-    fn default() -> Self {
+impl PaintApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, Settings::STORAGE_KEY))
+            .unwrap_or_default();
         Self {
             layers: vec![Layer::new(1, "Layer 1")],
             active: 0,
@@ -89,10 +162,21 @@ impl Default for PaintApp {
             opacity: 1.0,
             fill_tolerance: 32,
             fill_shapes: false,
+            settings,
+            settings_open: false,
+            selection: None,
+            floating: None,
+            clipboard: None,
             offset: Vec2::ZERO,
             zoom: 1.0,
+            canvas_rect: Rect::NOTHING,
+            canvas_hover: None,
             gesture: None,
             textures: HashMap::new(),
+            thumbs: HashMap::new(),
+            content_bounds: HashMap::new(),
+            thumbs_dirty: true,
+            thumbs_updated_at: 0.0,
         }
     }
 }
@@ -106,6 +190,11 @@ impl eframe::App for PaintApp {
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas_area(ui));
         self.brush_window(&ctx);
         self.layers_window(&ctx);
+        self.settings_window(&ctx);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, Settings::STORAGE_KEY, &self.settings);
     }
 }
 
@@ -115,12 +204,19 @@ impl PaintApp {
     }
 
     fn undo(&mut self) {
+        // Undoing right after a paste just drops the pasted image.
+        if self.floating.take().is_some() {
+            return;
+        }
         self.finish_gesture();
         self.history.undo(&mut self.layers);
         self.clamp_active();
     }
 
     fn redo(&mut self) {
+        if self.floating.is_some() {
+            return;
+        }
         self.finish_gesture();
         self.history.redo(&mut self.layers);
         self.clamp_active();
@@ -137,10 +233,18 @@ impl PaintApp {
         let redo_a = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
         let redo_b = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
         let undo = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
-        let (do_redo, do_undo) = ctx.input_mut(|i| {
+        let copy_merged = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::C);
+        let (do_redo, do_undo, do_copy_merged) = ctx.input_mut(|i| {
             let redo = i.consume_shortcut(&redo_a) || i.consume_shortcut(&redo_b);
-            (redo, i.consume_shortcut(&undo))
+            (
+                redo,
+                i.consume_shortcut(&undo),
+                i.consume_shortcut(&copy_merged),
+            )
         });
+        if do_copy_merged {
+            self.copy(ctx, true);
+        }
         if do_redo {
             self.redo();
         } else if do_undo {
@@ -149,6 +253,42 @@ impl PaintApp {
         for (tool, _, key) in Tool::ALL {
             if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key)) {
                 self.tool = tool;
+            }
+        }
+
+        let (enter, escape, delete) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Escape),
+                i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+            )
+        });
+        if enter {
+            self.place_floating();
+        }
+        // Esc / Delete drop a pending paste first, otherwise act on the selection.
+        if escape && self.floating.take().is_none() {
+            self.selection = None;
+        }
+        if delete && self.floating.take().is_none() {
+            self.delete_selection();
+        }
+
+        // egui-winit turns the platform copy/cut/paste shortcuts into events.
+        let events = ctx.input(|i| i.events.clone());
+        for event in events {
+            match event {
+                egui::Event::Copy => self.copy(ctx, false),
+                egui::Event::Cut => {
+                    self.copy(ctx, false);
+                    if self.floating.take().is_none() {
+                        self.delete_selection();
+                    }
+                }
+                egui::Event::PasteImage(image) => self.paste(image_from_egui(&image)),
+                // The clipboard had text; it may still hold an image as well.
+                egui::Event::Paste(_) => self.paste_from_clipboard(),
+                _ => {}
             }
         }
     }
@@ -202,10 +342,34 @@ impl PaintApp {
             }
             ui.separator();
 
+            let can_copy = self.selection.is_some() || self.floating.is_some();
+            if ui
+                .add_enabled(can_copy, egui::Button::new("Copy"))
+                .on_hover_text("Copy from the active layer (Ctrl+C)")
+                .clicked()
+            {
+                self.copy(ui.ctx(), false);
+            }
+            if ui
+                .add_enabled(can_copy, egui::Button::new("Copy merged"))
+                .on_hover_text("Copy what's visible on all layers (Ctrl+Shift+C)")
+                .clicked()
+            {
+                self.copy(ui.ctx(), true);
+            }
+            if ui.button("Paste").on_hover_text("Ctrl+V").clicked() {
+                self.paste_from_clipboard();
+            }
+            ui.separator();
+
             ui.label(format!("{:.0}%", self.zoom * 100.0));
             if ui.button("Reset view").clicked() {
                 self.offset = Vec2::ZERO;
                 self.zoom = 1.0;
+            }
+            ui.separator();
+            if ui.button("Settings").clicked() {
+                self.settings_open = !self.settings_open;
             }
         });
     }
@@ -216,39 +380,48 @@ impl PaintApp {
             .resizable(false)
             .anchor(Align2::LEFT_CENTER, [10.0, 0.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label("Size");
-                        ui.add(
-                            egui::Slider::new(&mut self.size, 1.0..=300.0)
-                                .vertical()
-                                .logarithmic(true)
-                                .integer(),
-                        );
-                    });
-                    ui.vertical(|ui| {
-                        ui.label("Opacity");
-                        let mut pct = self.opacity * 100.0;
-                        ui.add(
-                            egui::Slider::new(&mut pct, 1.0..=100.0)
-                                .vertical()
-                                .integer()
-                                .suffix("%"),
-                        );
-                        self.opacity = pct / 100.0;
-                    });
+                ui.set_width(64.0);
+                ui.vertical(|ui| {
+                    ui.label("Size");
+                    ui.add(
+                        egui::Slider::new(&mut self.size, MIN_SIZE..=MAX_SIZE)
+                            .vertical()
+                            .logarithmic(true)
+                            .integer(),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("Opacity");
+                    let mut pct = self.opacity * 100.0;
+                    ui.add(
+                        egui::Slider::new(&mut pct, 1.0..=100.0)
+                            .vertical()
+                            .integer()
+                            .suffix("%"),
+                    );
+                    self.opacity = pct / 100.0;
                 });
                 match self.tool {
                     Tool::Fill => {
                         ui.separator();
                         ui.label("Tolerance");
-                        ui.add(egui::Slider::new(&mut self.fill_tolerance, 0..=255));
+                        ui.add(egui::DragValue::new(&mut self.fill_tolerance).range(0..=255));
                     }
                     Tool::Circle => {
                         ui.separator();
                         ui.checkbox(&mut self.fill_shapes, "Filled");
                     }
                     _ => {}
+                }
+                if self.floating.is_some() {
+                    ui.separator();
+                    ui.vertical_centered_justified(|ui| {
+                        if ui.button("Place").on_hover_text("Enter").clicked() {
+                            self.place_floating();
+                        }
+                        if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                            self.floating = None;
+                        }
+                    });
                 }
             });
     }
@@ -295,10 +468,12 @@ impl PaintApp {
                     ui.horizontal(|ui| {
                         let layer = &mut self.layers[i];
                         ui.checkbox(&mut layer.visible, "").on_hover_text("Visible");
-                        if ui
+                        let thumb = self.thumbs.get(&layer.id).map(|t| t.id());
+                        let clicked_thumb = layer_thumbnail(ui, thumb, i == self.active).clicked();
+                        let clicked_name = ui
                             .selectable_label(i == self.active, layer.name.as_str())
-                            .clicked()
-                        {
+                            .clicked();
+                        if clicked_thumb || clicked_name {
                             self.active = i;
                         }
                     });
@@ -315,6 +490,17 @@ impl PaintApp {
                     ui.add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0));
                 });
             });
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let settings = &mut self.settings;
+        egui::Window::new("Settings")
+            .open(&mut self.settings_open)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| settings.ui(ui));
     }
 
     fn add_layer(&mut self) {
@@ -338,6 +524,89 @@ impl PaintApp {
         self.active = to;
     }
 
+    // ----- Selection & clipboard -----
+
+    /// Copies the selection (or the pending paste) to the clipboard. With
+    /// `merged`, copies what's visible across all layers instead of just the
+    /// active one.
+    fn copy(&mut self, ctx: &egui::Context, merged: bool) {
+        let image = match (&self.floating, self.selection) {
+            (Some(f), _) => f.image.clone(),
+            (None, Some(sel)) if merged => canvas::copy_region_merged(&self.layers, sel),
+            (None, Some(sel)) => canvas::copy_region(&self.layers[self.active], sel),
+            (None, None) => return,
+        };
+        ctx.copy_image(ColorImage::from_rgba_unmultiplied(
+            [image.width, image.height],
+            image.pixels.as_flattened(),
+        ));
+        self.clipboard = Some(image);
+    }
+
+    fn delete_selection(&mut self) {
+        let Some(sel) = self.selection else { return };
+        let mut op = PaintOp::new(self.active_layer_id(), PaintMode::Erase { strength: 1.0 });
+        op.apply(&mut self.layers[self.active], sel, |_, _| 1.0);
+        self.commit(op);
+    }
+
+    fn paste_from_clipboard(&mut self) {
+        let image = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_image())
+            .ok()
+            .map(|img| Image {
+                width: img.width,
+                height: img.height,
+                pixels: img
+                    .bytes
+                    .chunks_exact(4)
+                    .map(|p| [p[0], p[1], p[2], p[3]])
+                    .collect(),
+            })
+            .or_else(|| self.clipboard.clone());
+        if let Some(image) = image {
+            self.paste(image);
+        }
+    }
+
+    /// Shows `image` as a floating piece centered under the pointer (or the view).
+    fn paste(&mut self, image: Image) {
+        if image.width == 0 || image.height == 0 {
+            return;
+        }
+        self.place_floating();
+        let rect = self.canvas_rect;
+        let center = self.to_canvas(rect, self.canvas_hover.unwrap_or(rect.center()));
+        let x = (center[0] - image.width as f32 / 2.0).round() as i32;
+        let y = (center[1] - image.height as f32 / 2.0).round() as i32;
+        self.floating = Some(Floating {
+            image,
+            x,
+            y,
+            chunks: Vec::new(),
+        });
+        self.selection = None;
+    }
+
+    /// Commits the floating image onto the active layer.
+    fn place_floating(&mut self) {
+        let Some(f) = self.floating.take() else {
+            return;
+        };
+        let mut op = PaintOp::new(
+            self.active_layer_id(),
+            PaintMode::Paint {
+                color: [0; 4],
+                opacity: 1.0,
+            },
+        );
+        op.blit(&mut self.layers[self.active], &f.image, f.x, f.y);
+        self.commit(op);
+        self.selection = Some(f.rect());
+    }
+
+    // ----- Canvas -----
+
     fn to_canvas(&self, rect: Rect, p: Pos2) -> [f32; 2] {
         let v = (p - rect.min) / self.zoom + self.offset;
         [v.x, v.y]
@@ -345,6 +614,13 @@ impl PaintApp {
 
     fn to_screen(&self, rect: Rect, p: [f32; 2]) -> Pos2 {
         rect.min + (Vec2::new(p[0], p[1]) - self.offset) * self.zoom
+    }
+
+    fn screen_rect_of(&self, rect: Rect, r: IRect) -> Rect {
+        Rect::from_min_max(
+            self.to_screen(rect, [r.x0 as f32, r.y0 as f32]),
+            self.to_screen(rect, [r.x1 as f32, r.y1 as f32]),
+        )
     }
 
     fn visible_canvas_rect(&self, rect: Rect) -> IRect {
@@ -360,7 +636,9 @@ impl PaintApp {
 
     fn canvas_area(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
+        self.canvas_rect = rect;
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        self.canvas_hover = response.hover_pos();
         self.handle_view_input(ui, rect, &response);
         self.handle_tool_input(ui, rect);
         self.sync_textures(ui.ctx());
@@ -371,16 +649,29 @@ impl PaintApp {
         if !response.hovered() {
             return;
         }
-        let (scroll, pinch, pointer) =
-            ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
-        let factor = pinch * (scroll.y * 0.002).exp();
-        if factor != 1.0 {
-            let anchor = pointer.unwrap_or(rect.center());
-            let before = self.to_canvas(rect, anchor);
-            self.zoom = (self.zoom * factor).clamp(0.02, 64.0);
-            let after = self.to_canvas(rect, anchor);
-            self.offset += Vec2::new(before[0] - after[0], before[1] - after[1]);
+        let (scroll, pinch, pointer, mods) = ui.input(|i| {
+            (
+                i.smooth_scroll_delta,
+                i.zoom_delta(),
+                i.pointer.hover_pos(),
+                i.modifiers,
+            )
+        });
+        let factor = pinch * ((scroll.x + scroll.y) * 0.002).exp();
+        if factor == 1.0 {
+            return;
         }
+        let s = &self.settings;
+        if s.resize_with_wheel && s.resize_modifier.is_held(mods) {
+            let f = factor.powf(s.resize_sensitivity);
+            self.size = (self.size * f).clamp(MIN_SIZE, MAX_SIZE);
+            return;
+        }
+        let anchor = pointer.unwrap_or(rect.center());
+        let before = self.to_canvas(rect, anchor);
+        self.zoom = (self.zoom * factor).clamp(0.02, 64.0);
+        let after = self.to_canvas(rect, anchor);
+        self.offset += Vec2::new(before[0] - after[0], before[1] - after[1]);
     }
 
     fn handle_tool_input(&mut self, ui: &egui::Ui, rect: Rect) {
@@ -396,22 +687,30 @@ impl PaintApp {
                     pos,
                     button,
                     pressed: true,
-                    ..
+                    modifiers,
                 } => {
                     let on_canvas =
                         rect.contains(pos) && ctx.layer_id_at(pos) == Some(ui.layer_id());
                     if self.gesture.is_some() || !on_canvas {
                         continue;
                     }
-                    match button {
-                        PointerButton::Middle => {
-                            self.gesture = Some(Gesture::Pan { button, last: pos })
+                    let resize = self.settings.resize_with_drag
+                        && self.settings.resize_modifier.is_held(modifiers);
+                    let gesture = match button {
+                        PointerButton::Middle => Some(Gesture::Pan { button, last: pos }),
+                        PointerButton::Primary if resize => Some(Gesture::Resize {
+                            anchor: pos,
+                            start_size: self.size,
+                        }),
+                        PointerButton::Primary if space => Some(Gesture::Pan { button, last: pos }),
+                        PointerButton::Primary => {
+                            self.begin_tool(rect, pos);
+                            None
                         }
-                        PointerButton::Primary if space => {
-                            self.gesture = Some(Gesture::Pan { button, last: pos })
-                        }
-                        PointerButton::Primary => self.begin_tool(rect, pos),
-                        _ => {}
+                        _ => None,
+                    };
+                    if gesture.is_some() {
+                        self.gesture = gesture;
                     }
                 }
                 egui::Event::PointerButton {
@@ -448,6 +747,26 @@ impl PaintApp {
                 }
                 *last = p;
             }
+            Some(Gesture::Select { start }) => {
+                let end = [p[0].round() as i32, p[1].round() as i32];
+                self.selection = Some(IRect {
+                    x0: start[0].min(end[0]),
+                    y0: start[1].min(end[1]),
+                    x1: start[0].max(end[0]),
+                    y1: start[1].max(end[1]),
+                });
+            }
+            Some(Gesture::MoveFloating { grab }) => {
+                if let Some(f) = &mut self.floating {
+                    f.x = (p[0] - grab[0]).round() as i32;
+                    f.y = (p[1] - grab[1]).round() as i32;
+                }
+            }
+            Some(Gesture::Resize { anchor, start_size }) => {
+                // Doubles/halves the size every 100 px of horizontal movement.
+                let dx = (pos.x - anchor.x) / 100.0 * self.settings.resize_sensitivity;
+                self.size = (*start_size * dx.exp2()).clamp(MIN_SIZE, MAX_SIZE);
+            }
             _ => {}
         }
     }
@@ -466,6 +785,23 @@ impl PaintApp {
 
     fn begin_tool(&mut self, rect: Rect, pos: Pos2) {
         let p = self.to_canvas(rect, pos);
+        if let Some(f) = &self.floating {
+            let (x, y) = (p[0].floor() as i32, p[1].floor() as i32);
+            if f.rect().contains(x, y) {
+                let grab = [p[0] - f.x as f32, p[1] - f.y as f32];
+                self.gesture = Some(Gesture::MoveFloating { grab });
+            } else {
+                // Clicking elsewhere drops the pasted image in place.
+                self.place_floating();
+            }
+            return;
+        }
+        if self.tool == Tool::Select {
+            self.selection = None;
+            let start = [p[0].round() as i32, p[1].round() as i32];
+            self.gesture = Some(Gesture::Select { start });
+            return;
+        }
         if !self.layers[self.active].visible {
             // Painting on a hidden layer would be invisible and confusing.
             return;
@@ -494,6 +830,7 @@ impl PaintApp {
                     });
                 }
             }
+            Tool::Select => unreachable!(),
         }
     }
 
@@ -524,7 +861,16 @@ impl PaintApp {
                 );
                 self.commit(op);
             }
-            Some(Gesture::Pan { .. }) | None => {}
+            Some(Gesture::Select { .. }) => {
+                if self
+                    .selection
+                    .is_some_and(|s| s.width() <= 0 || s.height() <= 0)
+                {
+                    self.selection = None;
+                }
+            }
+            Some(Gesture::MoveFloating { .. } | Gesture::Resize { .. } | Gesture::Pan { .. })
+            | None => {}
         }
     }
 
@@ -535,13 +881,21 @@ impl PaintApp {
         }
     }
 
-    /// Uploads changed tiles to the GPU and drops textures of deleted layers/tiles.
+    // ----- Rendering -----
+
+    /// Uploads changed tiles to the GPU, drops textures of deleted layers/tiles,
+    /// and refreshes layer thumbnails.
     fn sync_textures(&mut self, ctx: &egui::Context) {
         for layer in &mut self.layers {
             for key in layer.dirty.drain() {
                 let tex_key = (layer.id, key);
+                self.thumbs_dirty = true;
                 match layer.tiles.get(&key) {
                     Some(tile) => {
+                        match canvas::tile_content_bounds(key, tile) {
+                            Some(b) => self.content_bounds.insert(tex_key, b),
+                            None => self.content_bounds.remove(&tex_key),
+                        };
                         let image = ColorImage::from_rgba_unmultiplied(
                             [TILE as usize, TILE as usize],
                             tile.as_flattened(),
@@ -557,16 +911,70 @@ impl PaintApp {
                     }
                     None => {
                         self.textures.remove(&tex_key);
+                        self.content_bounds.remove(&tex_key);
                     }
                 }
             }
         }
         let layers = &self.layers;
-        self.textures.retain(|(id, key), _| {
+        let exists = |id: &LayerId, key: &TileKey| {
             layers
                 .iter()
                 .any(|l| l.id == *id && l.tiles.contains_key(key))
-        });
+        };
+        self.textures.retain(|(id, key), _| exists(id, key));
+        self.content_bounds.retain(|(id, key), _| exists(id, key));
+        if self.thumbs.len() != layers.len()
+            || layers.iter().any(|l| !self.thumbs.contains_key(&l.id))
+        {
+            self.thumbs_dirty = true;
+        }
+
+        // Thumbnails are cheap but not free; refresh at most a few times per
+        // second while painting.
+        let now = ctx.input(|i| i.time);
+        if self.thumbs_dirty && (self.gesture.is_none() || now - self.thumbs_updated_at > 0.25) {
+            self.update_thumbnails(ctx);
+            self.thumbs_dirty = false;
+            self.thumbs_updated_at = now;
+        } else if self.thumbs_dirty {
+            ctx.request_repaint();
+        }
+
+        if let Some(f) = &mut self.floating
+            && f.chunks.is_empty()
+        {
+            f.chunks = image_chunks(ctx, &f.image);
+        }
+    }
+
+    fn update_thumbnails(&mut self, ctx: &egui::Context) {
+        // All layers share one frame so the previews line up with each other.
+        let region = self
+            .content_bounds
+            .values()
+            .copied()
+            .reduce(|a, b| a.union(&b));
+        let ids: Vec<LayerId> = self.layers.iter().map(|l| l.id).collect();
+        self.thumbs.retain(|id, _| ids.contains(id));
+        for layer in &self.layers {
+            let pixels = match region {
+                Some(r) => canvas::thumbnail(layer, r, THUMB),
+                None => vec![[0; 4]; THUMB * THUMB],
+            };
+            let image = ColorImage::from_rgba_unmultiplied([THUMB, THUMB], pixels.as_flattened());
+            match self.thumbs.get_mut(&layer.id) {
+                Some(t) => t.set(image, TextureOptions::LINEAR),
+                None => {
+                    let t = ctx.load_texture(
+                        format!("thumb-{}", layer.id),
+                        image,
+                        TextureOptions::LINEAR,
+                    );
+                    self.thumbs.insert(layer.id, t);
+                }
+            }
+        }
     }
 
     fn paint_canvas(&self, ui: &egui::Ui, rect: Rect, response: &egui::Response) {
@@ -577,21 +985,45 @@ impl PaintApp {
         let (tx0, ty0) = canvas::tile_key(view.x0, view.y0);
         let (tx1, ty1) = canvas::tile_key(view.x1, view.y1);
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
-            let tint = Color32::from_white_alpha((layer.opacity * 255.0).round() as u8);
-            for &key in layer.tiles.keys() {
-                if key.0 < tx0 || key.0 > tx1 || key.1 < ty0 || key.1 > ty1 {
-                    continue;
+        for (index, layer) in self.layers.iter().enumerate() {
+            if layer.visible && layer.opacity > 0.0 {
+                let tint = Color32::from_white_alpha((layer.opacity * 255.0).round() as u8);
+                for &key in layer.tiles.keys() {
+                    if key.0 < tx0 || key.0 > tx1 || key.1 < ty0 || key.1 > ty1 {
+                        continue;
+                    }
+                    let Some(tex) = self.textures.get(&(layer.id, key)) else {
+                        continue;
+                    };
+                    let r = IRect {
+                        x0: key.0 * TILE,
+                        y0: key.1 * TILE,
+                        x1: (key.0 + 1) * TILE,
+                        y1: (key.1 + 1) * TILE,
+                    };
+                    painter.image(tex.id(), self.screen_rect_of(rect, r), uv, tint);
                 }
-                let Some(tex) = self.textures.get(&(layer.id, key)) else {
-                    continue;
-                };
-                let min = [(key.0 * TILE) as f32, (key.1 * TILE) as f32];
-                let max = [min[0] + TILE as f32, min[1] + TILE as f32];
-                let screen =
-                    Rect::from_min_max(self.to_screen(rect, min), self.to_screen(rect, max));
-                painter.image(tex.id(), screen, uv, tint);
             }
+            // The pasted image previews where it will land: right above the active layer.
+            if index == self.active
+                && let Some(f) = &self.floating
+            {
+                for (chunk, tex) in &f.chunks {
+                    let r = IRect {
+                        x0: f.x + chunk.x0,
+                        y0: f.y + chunk.y0,
+                        x1: f.x + chunk.x1,
+                        y1: f.y + chunk.y1,
+                    };
+                    painter.image(tex.id(), self.screen_rect_of(rect, r), uv, Color32::WHITE);
+                }
+            }
+        }
+
+        if let Some(f) = &self.floating {
+            marching_ants(&painter, self.screen_rect_of(rect, f.rect()));
+        } else if let Some(sel) = self.selection {
+            marching_ants(&painter, self.screen_rect_of(rect, sel));
         }
 
         let outline = Stroke::new(1.0, Color32::from_gray(120));
@@ -609,17 +1041,136 @@ impl PaintApp {
             }
         }
 
-        // Brush outline under the cursor.
+        // While resizing, show the brush at the spot where the drag started.
+        if let Some(Gesture::Resize { anchor, .. }) = &self.gesture {
+            let r = (self.size / 2.0 * self.zoom).max(1.0);
+            painter.circle_stroke(*anchor, r, Stroke::new(2.0, Color32::WHITE));
+            painter.circle_stroke(*anchor, r, Stroke::new(1.0, Color32::BLACK));
+            painter.text(
+                *anchor + Vec2::new(r + 8.0, 0.0),
+                Align2::LEFT_CENTER,
+                format!("{:.0} px", self.size),
+                egui::FontId::proportional(14.0),
+                Color32::BLACK,
+            );
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            return;
+        }
+
+        // Cursor under the pointer.
         if let Some(pos) = response.hover_pos() {
+            let p = self.to_canvas(rect, pos);
+            let over_floating = self
+                .floating
+                .as_ref()
+                .is_some_and(|f| f.rect().contains(p[0].floor() as i32, p[1].floor() as i32));
+            if over_floating || matches!(self.gesture, Some(Gesture::MoveFloating { .. })) {
+                ui.ctx().set_cursor_icon(CursorIcon::Move);
+                return;
+            }
             match self.tool {
                 Tool::Brush | Tool::Eraser => {
                     painter.circle_stroke(pos, (self.size / 2.0 * self.zoom).max(1.0), outline);
                 }
-                Tool::Circle | Tool::Fill => {
+                Tool::Circle | Tool::Fill | Tool::Select => {
                     painter.line_segment([pos - Vec2::X * 6.0, pos + Vec2::X * 6.0], outline);
                     painter.line_segment([pos - Vec2::Y * 6.0, pos + Vec2::Y * 6.0], outline);
                 }
             }
         }
     }
+}
+
+/// Draws a selection outline visible on both light and dark content.
+fn marching_ants(painter: &egui::Painter, r: Rect) {
+    let pts = [
+        r.left_top(),
+        r.right_top(),
+        r.right_bottom(),
+        r.left_bottom(),
+        r.left_top(),
+    ];
+    painter.add(Shape::line(pts.to_vec(), Stroke::new(1.0, Color32::WHITE)));
+    painter.extend(Shape::dashed_line(
+        &pts,
+        Stroke::new(1.0, Color32::BLACK),
+        4.0,
+        4.0,
+    ));
+}
+
+/// Draws a layer preview over a checkerboard; returns its click response.
+fn layer_thumbnail(
+    ui: &mut egui::Ui,
+    tex: Option<egui::TextureId>,
+    active: bool,
+) -> egui::Response {
+    let size = 44.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 0.0, Color32::from_gray(200));
+    let cell = size / 6.0;
+    for y in 0..6 {
+        for x in 0..6 {
+            if (x + y) % 2 == 0 {
+                let min = rect.min + Vec2::new(x as f32, y as f32) * cell;
+                p.rect_filled(
+                    Rect::from_min_size(min, Vec2::splat(cell)),
+                    0.0,
+                    Color32::from_gray(245),
+                );
+            }
+        }
+    }
+    if let Some(tex) = tex {
+        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        p.image(tex, rect, uv, Color32::WHITE);
+    }
+    let stroke = if active {
+        Stroke::new(2.0, ui.visuals().selection.bg_fill)
+    } else {
+        Stroke::new(1.0, Color32::from_gray(90))
+    };
+    p.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+    resp
+}
+
+fn image_from_egui(img: &ColorImage) -> Image {
+    Image {
+        width: img.size[0],
+        height: img.size[1],
+        pixels: img
+            .pixels
+            .iter()
+            .map(|c| c.to_srgba_unmultiplied())
+            .collect(),
+    }
+}
+
+/// Uploads an image as textures of at most `CHUNK`×`CHUNK` pixels.
+fn image_chunks(ctx: &egui::Context, image: &Image) -> Vec<(IRect, TextureHandle)> {
+    let mut chunks = Vec::new();
+    for y0 in (0..image.height).step_by(CHUNK) {
+        for x0 in (0..image.width).step_by(CHUNK) {
+            let (w, h) = (CHUNK.min(image.width - x0), CHUNK.min(image.height - y0));
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for y in y0..y0 + h {
+                let row = &image.pixels[y * image.width + x0..y * image.width + x0 + w];
+                rgba.extend_from_slice(row.as_flattened());
+            }
+            let tex = ctx.load_texture(
+                format!("paste-{x0}-{y0}"),
+                ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+                TEXTURE_OPTIONS,
+            );
+            let r = IRect {
+                x0: x0 as i32,
+                y0: y0 as i32,
+                x1: (x0 + w) as i32,
+                y1: (y0 + h) as i32,
+            };
+            chunks.push((r, tex));
+        }
+    }
+    chunks
 }

@@ -171,6 +171,22 @@ impl PaintOp {
 
     /// Applies `cov(x, y)` (sampled at pixel centers) to every pixel in `area`.
     pub fn apply(&mut self, layer: &mut Layer, area: IRect, cov: impl Fn(f32, f32) -> f32) {
+        let color = match self.mode {
+            PaintMode::Paint { color, .. } => color,
+            PaintMode::Erase { .. } => [0; 4],
+        };
+        self.apply_src(layer, area, |x, y| {
+            Some((cov(x as f32 + 0.5, y as f32 + 0.5), color))
+        });
+    }
+
+    /// Like [`Self::apply`], but `src(x, y)` also chooses the color per pixel.
+    fn apply_src(
+        &mut self,
+        layer: &mut Layer,
+        area: IRect,
+        src: impl Fn(i32, i32) -> Option<(f32, Rgba)>,
+    ) {
         if area.width() <= 0 || area.height() <= 0 {
             return;
         }
@@ -183,7 +199,7 @@ impl PaintOp {
                 let x1 = area.x1.min((tx + 1) * TILE);
                 let y0 = area.y0.max(ty * TILE);
                 let y1 = area.y1.min((ty + 1) * TILE);
-                self.apply_tile(layer, key, x0..x1, y0..y1, &cov);
+                self.apply_tile(layer, key, x0..x1, y0..y1, &src);
             }
         }
     }
@@ -194,7 +210,7 @@ impl PaintOp {
         key: TileKey,
         xs: std::ops::Range<i32>,
         ys: std::ops::Range<i32>,
-        cov: &impl Fn(f32, f32) -> f32,
+        src: &impl Fn(i32, i32) -> Option<(f32, Rgba)>,
     ) {
         let erasing = matches!(self.mode, PaintMode::Erase { .. });
         // Erasing never needs to allocate a tile that doesn't exist yet.
@@ -204,7 +220,9 @@ impl PaintOp {
         let mut touched = false;
         for y in ys {
             for x in xs.clone() {
-                let c = cov(x as f32 + 0.5, y as f32 + 0.5);
+                let Some((c, color)) = src(x, y) else {
+                    continue;
+                };
                 if c <= 0.0 {
                     continue;
                 }
@@ -223,7 +241,7 @@ impl PaintOp {
                     .or_insert_with(|| layer.tiles.get(&key).cloned());
                 let old = before.as_ref().map_or([0; 4], |t| t[i]);
                 let new = match self.mode {
-                    PaintMode::Paint { color, opacity } => blend_over(old, color, c * opacity),
+                    PaintMode::Paint { opacity, .. } => blend_over(old, color, c * opacity),
                     PaintMode::Erase { strength } => erase(old, c * strength),
                 };
                 layer.tiles.entry(key).or_insert_with(empty_tile)[i] = new;
@@ -233,6 +251,20 @@ impl PaintOp {
         if touched {
             layer.dirty.insert(key);
         }
+    }
+
+    /// Composites `image` onto the layer with its top-left corner at (`x`, `y`).
+    pub fn blit(&mut self, layer: &mut Layer, image: &Image, x: i32, y: i32) {
+        let area = IRect {
+            x0: x,
+            y0: y,
+            x1: x + image.width as i32,
+            y1: y + image.height as i32,
+        };
+        self.apply_src(layer, area, |px, py| {
+            let p = image.pixels[(py - y) as usize * image.width + (px - x) as usize];
+            (p[3] > 0).then(|| (p[3] as f32 / 255.0, p))
+        });
     }
 
     /// Stamps a round brush along the segment `a`–`b`.
@@ -306,6 +338,108 @@ fn bbox(x0: f32, y0: f32, x1: f32, y1: f32) -> IRect {
         x1: x1.ceil() as i32 + 1,
         y1: y1.ceil() as i32 + 1,
     }
+}
+
+/// A standalone straight-RGBA image (clipboard contents, pasted pieces).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Image {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<Rgba>,
+}
+
+/// Copies the pixels of `layer` inside `area`.
+pub fn copy_region(layer: &Layer, area: IRect) -> Image {
+    let (w, h) = (area.width().max(0) as usize, area.height().max(0) as usize);
+    let mut pixels = Vec::with_capacity(w * h);
+    for y in area.y0..area.y1 {
+        for x in area.x0..area.x1 {
+            pixels.push(layer.pixel(x, y));
+        }
+    }
+    Image {
+        width: w,
+        height: h,
+        pixels,
+    }
+}
+
+/// Copies `area` as it appears with all visible layers composited.
+pub fn copy_region_merged(layers: &[Layer], area: IRect) -> Image {
+    let mut image = copy_region(&Layer::new(0, ""), area);
+    for layer in layers.iter().filter(|l| l.visible) {
+        let src = copy_region(layer, area);
+        for (dst, s) in image.pixels.iter_mut().zip(&src.pixels) {
+            if s[3] > 0 {
+                *dst = blend_over(*dst, *s, s[3] as f32 / 255.0 * layer.opacity);
+            }
+        }
+    }
+    image
+}
+
+/// Tight bounds of the non-transparent pixels in a tile, in canvas pixels.
+pub fn tile_content_bounds(key: TileKey, tile: &[Rgba]) -> Option<IRect> {
+    let mut b: Option<IRect> = None;
+    for (i, p) in tile.iter().enumerate() {
+        if p[3] == 0 {
+            continue;
+        }
+        let x = key.0 * TILE + i as i32 % TILE;
+        let y = key.1 * TILE + i as i32 / TILE;
+        let r = IRect {
+            x0: x,
+            y0: y,
+            x1: x + 1,
+            y1: y + 1,
+        };
+        b = Some(b.map_or(r, |b| b.union(&r)));
+    }
+    b
+}
+
+/// Renders a `size`×`size` preview of `region` of the layer, fitted and
+/// centered with its aspect ratio preserved. Each output pixel takes the
+/// average color but the strongest alpha of a few samples, so thin strokes
+/// stay visible when scaled down.
+pub fn thumbnail(layer: &Layer, region: IRect, size: usize) -> Vec<Rgba> {
+    let mut out = vec![[0u8; 4]; size * size];
+    let (rw, rh) = (region.width().max(1) as f32, region.height().max(1) as f32);
+    let scale = rw.max(rh) / size as f32;
+    let off_x = (size as f32 - rw / scale) / 2.0;
+    let off_y = (size as f32 - rh / scale) / 2.0;
+    const N: usize = 3;
+    for oy in 0..size {
+        for ox in 0..size {
+            let mut acc = [0f32; 4];
+            let mut max_a = 0u8;
+            for sy in 0..N {
+                for sx in 0..N {
+                    let fx = (ox as f32 - off_x + (sx as f32 + 0.5) / N as f32) * scale;
+                    let fy = (oy as f32 - off_y + (sy as f32 + 0.5) / N as f32) * scale;
+                    if fx < 0.0 || fy < 0.0 || fx >= rw || fy >= rh {
+                        continue;
+                    }
+                    let p = layer.pixel(region.x0 + fx as i32, region.y0 + fy as i32);
+                    let a = p[3] as f32;
+                    max_a = max_a.max(p[3]);
+                    acc[0] += p[0] as f32 * a;
+                    acc[1] += p[1] as f32 * a;
+                    acc[2] += p[2] as f32 * a;
+                    acc[3] += a;
+                }
+            }
+            if acc[3] > 0.0 {
+                out[oy * size + ox] = [
+                    (acc[0] / acc[3]) as u8,
+                    (acc[1] / acc[3]) as u8,
+                    (acc[2] / acc[3]) as u8,
+                    max_a,
+                ];
+            }
+        }
+    }
+    out
 }
 
 fn color_matches(a: Rgba, b: Rgba, tolerance: u8) -> bool {
@@ -502,5 +636,106 @@ mod tests {
         assert_eq!(layer.pixel(-10, -10), RED);
         assert_eq!(layer.pixel(9, 9), RED);
         assert_eq!(layer.pixel(10, 10), [0; 4]);
+    }
+
+    #[test]
+    fn copy_and_blit_roundtrip() {
+        let mut layer = Layer::new(1, "L");
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: RED,
+                opacity: 1.0,
+            },
+        );
+        op.stroke_segment(&mut layer, [5.0, 5.0], [5.0, 5.0], 3.0);
+        let img = copy_region(
+            &layer,
+            IRect {
+                x0: 0,
+                y0: 0,
+                x1: 10,
+                y1: 10,
+            },
+        );
+        assert_eq!((img.width, img.height), (10, 10));
+        assert_eq!(img.pixels[5 * 10 + 5], RED);
+
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: [0; 4],
+                opacity: 1.0,
+            },
+        );
+        op.blit(&mut layer, &img, -300, 40);
+        assert_eq!(layer.pixel(-295, 45), RED);
+        assert_eq!(layer.pixel(-300, 40), [0; 4]);
+        assert!(op.finish().is_some());
+    }
+
+    #[test]
+    fn copy_merged_composites_visible_layers() {
+        let area = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        };
+        let mut bottom = Layer::new(1, "a");
+        let mut top = Layer::new(2, "b");
+        let mut hidden = Layer::new(3, "c");
+        hidden.visible = false;
+        for (layer, color) in [
+            (&mut bottom, RED),
+            (&mut top, [0, 0, 255, 255]),
+            (&mut hidden, [0, 255, 0, 255]),
+        ] {
+            let mut op = PaintOp::new(
+                layer.id,
+                PaintMode::Paint {
+                    color,
+                    opacity: 1.0,
+                },
+            );
+            op.apply(
+                layer,
+                IRect {
+                    x0: 0,
+                    y0: 0,
+                    x1: if layer.id == 2 { 2 } else { 4 },
+                    y1: 4,
+                },
+                |_, _| 1.0,
+            );
+        }
+        let img = copy_region_merged(&[bottom, top, hidden], area);
+        assert_eq!(img.pixels[0], [0, 0, 255, 255]);
+        assert_eq!(img.pixels[3], RED);
+    }
+
+    #[test]
+    fn content_bounds_and_thumbnail() {
+        let mut layer = Layer::new(1, "L");
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: RED,
+                opacity: 1.0,
+            },
+        );
+        op.stroke_segment(&mut layer, [-20.0, 10.0], [20.0, 10.0], 2.0);
+        let b = layer
+            .tiles
+            .iter()
+            .filter_map(|(k, t)| tile_content_bounds(*k, t))
+            .reduce(|a, b| a.union(&b))
+            .unwrap();
+        assert!(
+            b.x0 >= -23 && b.x1 <= 23 && b.y0 >= 7 && b.y1 <= 13,
+            "{b:?}"
+        );
+        let thumb = thumbnail(&layer, b, 16);
+        assert!(thumb.iter().any(|p| p[0] == 255 && p[3] > 0));
     }
 }
