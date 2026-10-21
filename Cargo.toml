@@ -1,0 +1,19 @@
+[package]
+name = "paint"
+version = "0.1.0"
+description = "A simple, fast-loading paint program"
+rust-version = "1.95"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37"
+
+# Keep debug builds responsive enough to paint with.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
