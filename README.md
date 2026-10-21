@@ -12,7 +12,7 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
   Grid, rectangle Select, Text.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
-  White is treated as transparent when pasting (toggleable).
+  Color 2 (white by default) is treated as transparent when pasting (toggleable).
 - **Two colors, like MS Paint** – the left mouse button paints with color 1, the right
   button with color 2. Left-click a palette swatch to set color 1, right-click to set
   color 2; click either color in the toolbar for a full picker, `X` swaps them. The last

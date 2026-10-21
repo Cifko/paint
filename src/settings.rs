@@ -48,8 +48,9 @@ pub struct Settings {
     pub resize_sensitivity: f32,
     /// Held while drawing a rectangle (selection, shape, grid) to make it square.
     pub square_modifier: ModifierKey,
-    /// Make pure white pixels of pasted images transparent.
-    pub paste_white_transparent: bool,
+    /// Make pixels of color 2 in pasted images transparent.
+    #[serde(alias = "paste_white_transparent")]
+    pub paste_secondary_transparent: bool,
 }
 
 impl Default for Settings {
@@ -60,7 +61,7 @@ impl Default for Settings {
             resize_with_wheel: true,
             resize_sensitivity: 1.0,
             square_modifier: ModifierKey::Shift,
-            paste_white_transparent: true,
+            paste_secondary_transparent: true,
         }
     }
 }
@@ -114,8 +115,8 @@ impl Settings {
         ui.separator();
         ui.heading("Paste");
         ui.checkbox(
-            &mut self.paste_white_transparent,
-            "Treat white as transparent",
+            &mut self.paste_secondary_transparent,
+            "Treat color 2 as transparent",
         );
         ui.separator();
         if ui.button("Restore defaults").clicked() {
