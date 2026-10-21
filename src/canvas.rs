@@ -530,11 +530,12 @@ pub fn copy_region_merged(layers: &[Layer], area: IRect) -> Image {
     image
 }
 
-/// Tight bounds of the non-transparent pixels in a tile, in canvas pixels.
-pub fn tile_content_bounds(key: TileKey, tile: &[Rgba]) -> Option<IRect> {
+/// Tight bounds of the pixels in a tile that differ from the layer's
+/// `background` (its infinite default color), in canvas pixels.
+pub fn tile_content_bounds(key: TileKey, tile: &[Rgba], background: Rgba) -> Option<IRect> {
     let mut b: Option<IRect> = None;
-    for (i, p) in tile.iter().enumerate() {
-        if p[3] == 0 {
+    for (i, &p) in tile.iter().enumerate() {
+        if p == background || (p[3] == 0 && background[3] == 0) {
             continue;
         }
         let x = key.0 * TILE + i as i32 % TILE;
@@ -1069,7 +1070,7 @@ mod tests {
         let b = layer
             .tiles
             .iter()
-            .filter_map(|(k, t)| tile_content_bounds(*k, t))
+            .filter_map(|(k, t)| tile_content_bounds(*k, t, layer.default))
             .reduce(|a, b| a.union(&b))
             .unwrap();
         assert!(
@@ -1301,5 +1302,41 @@ mod tests {
         op.stroke_segment(&mut layer, [0.0, 0.0], [0.0, 0.0], 3.0);
         assert_eq!(layer.pixel(0, 0), [0; 4]);
         assert_eq!(layer.pixel(10, 0), RED);
+    }
+
+    #[test]
+    fn background_fill_does_not_grow_content_bounds() {
+        let mut layer = Layer::new(1, "L");
+        ring(
+            &mut layer,
+            IRect {
+                x0: -40,
+                y0: -40,
+                x1: 40,
+                y1: 40,
+            },
+        );
+        let bounds = |layer: &Layer| {
+            layer
+                .tiles
+                .iter()
+                .filter_map(|(k, t)| tile_content_bounds(*k, t, layer.default))
+                .reduce(|a, b| a.union(&b))
+                .unwrap()
+        };
+        let before = bounds(&layer);
+        flood_fill(&mut layer, 100, 0, 32, RED, 1.0).unwrap();
+        // The fill may cover the faintest anti-aliased edge pixels, but the
+        // background around the circle must not count as content.
+        let after = bounds(&layer);
+        assert_eq!(
+            after.union(&before),
+            before,
+            "{after:?} grew past {before:?}"
+        );
+        assert!(
+            after.width() >= before.width() - 2,
+            "{after:?} vs {before:?}"
+        );
     }
 }
