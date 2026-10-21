@@ -196,7 +196,13 @@ pub struct PaintApp {
     history: History,
 
     tool: Tool,
-    color: Color32,
+    /// Color 1 (left mouse button) and color 2 (right mouse button).
+    primary: Color32,
+    secondary: Color32,
+    /// Whether the last canvas click used the right button, i.e. color 2.
+    use_secondary: bool,
+    /// Mouse button that started the current gesture.
+    gesture_button: PointerButton,
     /// Size and opacity, kept separately for painting tools, the eraser and text.
     paint_brush: Brush,
     eraser_brush: Brush,
@@ -257,7 +263,10 @@ impl PaintApp {
             next_layer_id: 2,
             history: History::new(200),
             tool: Tool::Brush,
-            color: Color32::BLACK,
+            primary: Color32::BLACK,
+            secondary: Color32::WHITE,
+            use_secondary: false,
+            gesture_button: PointerButton::Primary,
             paint_brush: Brush {
                 size: 8.0,
                 opacity: 1.0,
@@ -395,6 +404,9 @@ impl PaintApp {
             }
         }
 
+        if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::X)) {
+            std::mem::swap(&mut self.primary, &mut self.secondary);
+        }
         let (enter, escape, delete) = ctx.input(|i| {
             (
                 i.key_pressed(Key::Enter),
@@ -490,6 +502,68 @@ impl PaintApp {
         self.commit(op);
     }
 
+    /// Color 1 in front, color 2 behind it, like in MS Paint. Clicking either
+    /// opens its color picker; the arrow swaps them.
+    fn color_pair(&mut self, ui: &mut egui::Ui) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(46.0, 26.0), Sense::hover());
+        let size = Vec2::splat(18.0);
+        let front = Rect::from_min_size(rect.min, size);
+        let back = Rect::from_min_size(rect.min + Vec2::new(10.0, 8.0), size);
+        let swap = Rect::from_min_size(rect.min + Vec2::new(31.0, 0.0), Vec2::splat(14.0));
+
+        // Register the back swatch first so the front one wins where they overlap.
+        let back_resp = ui
+            .interact(back, ui.scope_id().with("color2"), Sense::click())
+            .on_hover_text("Color 2 (right mouse button). Click to change.");
+        let front_resp = ui
+            .interact(front, ui.scope_id().with("color1"), Sense::click())
+            .on_hover_text("Color 1 (left mouse button). Click to change.");
+        let swap_resp = ui
+            .interact(swap, ui.scope_id().with("swap_colors"), Sense::click())
+            .on_hover_text("Swap colors (X)");
+
+        let painter = ui.painter();
+        let frame = Stroke::new(1.0, Color32::from_gray(150));
+        swatch(painter, back, self.secondary);
+        painter.rect_stroke(back, 2.0, frame, egui::StrokeKind::Outside);
+        swatch(painter, front, self.primary);
+        painter.rect_stroke(front, 2.0, frame, egui::StrokeKind::Outside);
+        let arrow = if swap_resp.hovered() {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().text_color()
+        };
+        painter.text(
+            swap.center(),
+            Align2::CENTER_CENTER,
+            "⇄",
+            egui::FontId::proportional(13.0),
+            arrow,
+        );
+        if swap_resp.clicked() {
+            std::mem::swap(&mut self.primary, &mut self.secondary);
+        }
+
+        for (resp, color) in [
+            (front_resp, &mut self.primary),
+            (back_resp, &mut self.secondary),
+        ] {
+            egui::Popup::from_toggle_button_response(&resp)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    // The picker can't show "clear"; start from white instead.
+                    if *color == Color32::TRANSPARENT {
+                        *color = Color32::WHITE;
+                    }
+                    egui::color_picker::color_picker_color32(
+                        ui,
+                        color,
+                        egui::color_picker::Alpha::Opaque,
+                    );
+                });
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for (tool, name, key, icon) in Tool::ALL {
@@ -502,39 +576,35 @@ impl PaintApp {
             }
             ui.separator();
 
-            egui::color_picker::color_edit_button_srgba(
-                ui,
-                &mut self.color,
-                egui::color_picker::Alpha::Opaque,
-            );
+            self.color_pair(ui);
             for c in PALETTE.into_iter().chain([Color32::TRANSPARENT]) {
                 let (rect, mut resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                let selected = c == self.color;
-                if c == Color32::TRANSPARENT {
-                    // The clear color: white with a red slash, like "no color".
-                    ui.painter().rect_filled(rect, 3.0, Color32::WHITE);
-                    ui.painter().line_segment(
-                        [rect.left_bottom(), rect.right_top()],
-                        Stroke::new(2.0, Color32::from_rgb(220, 40, 40)),
+                swatch(ui.painter(), rect, c);
+                let marked = if c == self.primary {
+                    Some(ui.visuals().selection.bg_fill)
+                } else if c == self.secondary {
+                    Some(Color32::from_gray(200))
+                } else {
+                    None
+                };
+                if let Some(mark) = marked {
+                    ui.painter().rect_stroke(
+                        rect,
+                        3.0,
+                        Stroke::new(2.0, mark),
+                        egui::StrokeKind::Inside,
                     );
+                }
+                if c == Color32::TRANSPARENT {
                     resp = resp.on_hover_text(
                         "Clear: fill, brush, shapes and text erase instead of painting",
                     );
-                } else {
-                    ui.painter().rect_filled(rect, 3.0, c);
                 }
-                ui.painter().rect_stroke(
-                    rect,
-                    3.0,
-                    if selected {
-                        Stroke::new(2.0, ui.visuals().selection.bg_fill)
-                    } else {
-                        Stroke::new(1.0, Color32::from_gray(90))
-                    },
-                    egui::StrokeKind::Inside,
-                );
                 if resp.clicked() {
-                    self.color = c;
+                    self.primary = c;
+                }
+                if resp.secondary_clicked() {
+                    self.secondary = c;
                 }
             }
             ui.separator();
@@ -1035,12 +1105,11 @@ impl PaintApp {
                             start_size: self.brush().size,
                         }),
                         PointerButton::Primary if space => Some(Gesture::Pan { button, last: pos }),
-                        PointerButton::Primary => {
+                        PointerButton::Primary | PointerButton::Secondary => {
+                            // Like MS Paint: the right button paints with color 2.
+                            self.use_secondary = button == PointerButton::Secondary;
+                            self.gesture_button = button;
                             self.begin_tool(rect, pos);
-                            None
-                        }
-                        PointerButton::Secondary => {
-                            self.grid = None;
                             None
                         }
                         _ => None,
@@ -1057,7 +1126,7 @@ impl PaintApp {
                 } => {
                     let ends = match &self.gesture {
                         Some(Gesture::Pan { button: b, .. }) => *b == button,
-                        Some(_) => button == PointerButton::Primary,
+                        Some(_) => button == self.gesture_button,
                         None => false,
                     };
                     if ends {
@@ -1121,13 +1190,22 @@ impl PaintApp {
         }
     }
 
+    /// The color for the current click: color 2 after a right click.
+    fn color(&self) -> Color32 {
+        if self.use_secondary {
+            self.secondary
+        } else {
+            self.primary
+        }
+    }
+
     /// Painting with the current color; the clear color erases instead.
     fn color_mode(&self, opacity: f32) -> PaintMode {
-        if self.color == Color32::TRANSPARENT {
+        if self.color() == Color32::TRANSPARENT {
             PaintMode::Erase { strength: opacity }
         } else {
             PaintMode::Paint {
-                color: self.color.to_array(),
+                color: self.color().to_array(),
                 opacity,
             }
         }
@@ -1135,10 +1213,10 @@ impl PaintApp {
 
     /// Color for on-screen previews; erasing shapes preview in gray.
     fn preview_color(&self) -> Color32 {
-        if self.color == Color32::TRANSPARENT {
+        if self.color() == Color32::TRANSPARENT {
             Color32::from_gray(128).gamma_multiply(0.6)
         } else {
-            self.color.gamma_multiply(self.brush().opacity)
+            self.color().gamma_multiply(self.brush().opacity)
         }
     }
 
@@ -1401,7 +1479,7 @@ impl PaintApp {
                     rect: canvas::rect_from_corners(*start, end),
                     size: self.brush().size,
                     filled: self.fill_shapes,
-                    color: self.color.to_array(),
+                    color: self.color().to_array(),
                     opacity: self.brush().opacity,
                 })
             }
@@ -1409,7 +1487,7 @@ impl PaintApp {
                 origin: edit.origin,
                 text: edit.buffer.text.clone(),
                 style: self.text_style(),
-                color: self.color.to_array(),
+                color: self.color().to_array(),
                 opacity: self.brush().opacity,
             }),
             _ => None,
@@ -1815,6 +1893,19 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool) -> egui::Response 
     ui.painter().rect_filled(rect, 4.0, bg);
     icons::paint(ui.painter(), rect.shrink(5.0), icon, fg);
     resp
+}
+
+/// Fills `rect` with `color`; the clear color is shown as white with a red slash.
+fn swatch(painter: &egui::Painter, rect: Rect, color: Color32) {
+    if color == Color32::TRANSPARENT {
+        painter.rect_filled(rect, 2.0, Color32::WHITE);
+        painter.line_segment(
+            [rect.left_bottom(), rect.right_top()],
+            Stroke::new(2.0, Color32::from_rgb(220, 40, 40)),
+        );
+    } else {
+        painter.rect_filled(rect, 2.0, color);
+    }
 }
 
 /// Draws a selection outline visible on both light and dark content.
