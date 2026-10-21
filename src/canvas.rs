@@ -39,9 +39,6 @@ impl IRect {
     pub fn height(&self) -> i32 {
         self.y1 - self.y0
     }
-    pub fn contains(&self, x: i32, y: i32) -> bool {
-        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
-    }
     pub fn union(&self, o: &IRect) -> IRect {
         IRect {
             x0: self.x0.min(o.x0),
@@ -817,6 +814,117 @@ impl GridKind {
             }
         }
         out
+    }
+}
+
+/// A 2×2 linear transform `[a, b, c, d]`: x' = a·x + b·y, y' = c·x + d·y.
+pub type Matrix = [f32; 4];
+
+pub const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0];
+
+/// `m · n` (apply `n` first, then `m`).
+pub fn mat_mul(m: Matrix, n: Matrix) -> Matrix {
+    [
+        m[0] * n[0] + m[1] * n[2],
+        m[0] * n[1] + m[1] * n[3],
+        m[2] * n[0] + m[3] * n[2],
+        m[2] * n[1] + m[3] * n[3],
+    ]
+}
+
+pub fn mat_apply(m: Matrix, v: [f32; 2]) -> [f32; 2] {
+    [m[0] * v[0] + m[1] * v[1], m[2] * v[0] + m[3] * v[1]]
+}
+
+pub fn mat_inverse(m: Matrix) -> Option<Matrix> {
+    let det = m[0] * m[3] - m[1] * m[2];
+    (det.abs() > 1e-6).then(|| [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det])
+}
+
+pub fn rotation(angle: f32) -> Matrix {
+    let (s, c) = angle.sin_cos();
+    [c, -s, s, c]
+}
+
+/// Whether `m` only flips and turns by multiples of 90° (pixels map 1:1).
+fn is_pixel_exact(m: Matrix) -> bool {
+    m.iter()
+        .all(|v| v.abs() < 1e-4 || (v.abs() - 1.0).abs() < 1e-4)
+}
+
+/// Transforms `src` by `m` around its center. The result is the bounding box
+/// of the transformed image, sharing its center. Flips and 90° turns copy
+/// pixels exactly; anything else is resampled bilinearly.
+pub fn transform_image(src: &Image, m: Matrix) -> Image {
+    let (w, h) = (src.width as f32, src.height as f32);
+    let Some(inv) = mat_inverse(m) else {
+        return Image {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+    };
+    let corners =
+        [[-w, -h], [w, -h], [w, h], [-w, h]].map(|c| mat_apply(m, [c[0] / 2.0, c[1] / 2.0]));
+    let max_x = corners.iter().map(|c| c[0].abs()).fold(0.0, f32::max);
+    let max_y = corners.iter().map(|c| c[1].abs()).fold(0.0, f32::max);
+    let (ow, oh) = (
+        (2.0 * max_x - 1e-3).ceil() as usize,
+        (2.0 * max_y - 1e-3).ceil() as usize,
+    );
+    let exact = is_pixel_exact(m);
+    let mut pixels = vec![[0u8; 4]; ow * oh];
+    let get = |x: i32, y: i32| -> [f32; 4] {
+        if x < 0 || y < 0 || x >= src.width as i32 || y >= src.height as i32 {
+            return [0.0; 4];
+        }
+        let p = src.pixels[y as usize * src.width + x as usize];
+        let a = p[3] as f32 / 255.0;
+        [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, a]
+    };
+    for oy in 0..oh {
+        for ox in 0..ow {
+            // Pixel center relative to the image center, back into the source.
+            let q = [
+                ox as f32 + 0.5 - ow as f32 / 2.0,
+                oy as f32 + 0.5 - oh as f32 / 2.0,
+            ];
+            let l = mat_apply(inv, q);
+            let (sx, sy) = (l[0] + w / 2.0 - 0.5, l[1] + h / 2.0 - 0.5);
+            let px = if exact {
+                get(sx.round() as i32, sy.round() as i32)
+            } else {
+                let (x0, y0) = (sx.floor(), sy.floor());
+                let (fx, fy) = (sx - x0, sy - y0);
+                let (x0, y0) = (x0 as i32, y0 as i32);
+                let mut acc = [0.0f32; 4];
+                for (dx, dy, wgt) in [
+                    (0, 0, (1.0 - fx) * (1.0 - fy)),
+                    (1, 0, fx * (1.0 - fy)),
+                    (0, 1, (1.0 - fx) * fy),
+                    (1, 1, fx * fy),
+                ] {
+                    let s = get(x0 + dx, y0 + dy);
+                    for c in 0..4 {
+                        acc[c] += s[c] * wgt;
+                    }
+                }
+                acc
+            };
+            if px[3] > 0.001 {
+                pixels[oy * ow + ox] = [
+                    (px[0] / px[3]).round().clamp(0.0, 255.0) as u8,
+                    (px[1] / px[3]).round().clamp(0.0, 255.0) as u8,
+                    (px[2] / px[3]).round().clamp(0.0, 255.0) as u8,
+                    (px[3] * 255.0).round() as u8,
+                ];
+            }
+        }
+    }
+    Image {
+        width: ow,
+        height: oh,
+        pixels,
     }
 }
 
@@ -1828,5 +1936,51 @@ mod tests {
                 .any(|p| (p[0] - 10.0).abs() < 0.01 && p[1].abs() < 0.01)
         );
         assert!(ngon_from_vertices([1.0, 1.0], [1.0, 1.0], 6).is_empty());
+    }
+
+    fn sample_image() -> Image {
+        // 3x2: distinct colors to track where pixels go.
+        let c = |i: u8| [i * 40, 0, 0, 255];
+        Image {
+            width: 3,
+            height: 2,
+            pixels: (0..6).map(c).collect(),
+        }
+    }
+
+    #[test]
+    fn flips_and_quarter_turns_are_exact() {
+        let img = sample_image();
+        assert_eq!(transform_image(&img, IDENTITY), img);
+        let flipped = transform_image(&img, mat_mul([-1.0, 0.0, 0.0, 1.0], IDENTITY));
+        assert_eq!(flipped.pixels[0], img.pixels[2]);
+        assert_eq!(flipped.pixels[3], img.pixels[5]);
+        let turned = transform_image(&img, rotation(std::f32::consts::FRAC_PI_2));
+        assert_eq!((turned.width, turned.height), (2, 3));
+        // Clockwise on screen (y down): the bottom-left pixel ends up top-left.
+        assert_eq!(turned.pixels[0], img.pixels[3]);
+        let back = transform_image(&turned, rotation(-std::f32::consts::FRAC_PI_2));
+        assert_eq!(back, img);
+    }
+
+    #[test]
+    fn rotation_grows_the_bounding_box() {
+        let img = Image {
+            width: 100,
+            height: 100,
+            pixels: vec![RED; 10_000],
+        };
+        let r = transform_image(&img, rotation(std::f32::consts::FRAC_PI_4));
+        assert!((r.width as i32 - 142).abs() <= 1, "{}", r.width);
+        assert_eq!(
+            r.pixels[r.width * (r.height / 2) + r.width / 2],
+            RED,
+            "center"
+        );
+        assert_eq!(r.pixels[0][3], 0, "corners are empty");
+        let m = mat_mul(rotation(0.3), [1.0, 0.5, 0.0, 1.0]);
+        let inv = mat_inverse(m).unwrap();
+        let p = mat_apply(inv, mat_apply(m, [3.0, -7.0]));
+        assert!((p[0] - 3.0).abs() < 1e-4 && (p[1] + 7.0).abs() < 1e-4);
     }
 }

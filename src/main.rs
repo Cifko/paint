@@ -3,6 +3,7 @@
 mod app;
 mod canvas;
 mod file;
+mod floating;
 mod history;
 mod icons;
 mod settings;

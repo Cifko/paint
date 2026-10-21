@@ -12,6 +12,7 @@ use crate::canvas::{
     self, GridKind, IRect, Image, Layer, LayerId, PaintMode, PaintOp, ShapeKind, TILE, TileKey,
 };
 use crate::file;
+use crate::floating::{Floating, Frame, Handle};
 use crate::history::{Action, History};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
@@ -160,7 +161,13 @@ enum Gesture {
     Select {
         start: [i32; 2],
     },
-    /// Dragging the floating pasted image; `grab` is the pointer's offset from its corner.
+    /// Dragging a transform handle of the floating piece.
+    Transform {
+        handle: Handle,
+        start: [f32; 2],
+        frame: Frame,
+    },
+    /// Dragging the floating piece; `grab` is the pointer's offset from its center.
     MoveFloating {
         grab: [f32; 2],
     },
@@ -173,56 +180,6 @@ enum Gesture {
         button: PointerButton,
         last: Pos2,
     },
-}
-
-/// A pasted image that hasn't been placed onto a layer yet.
-struct Floating {
-    /// The image as pasted.
-    original: Image,
-    /// What will be placed: `original`, possibly with one color keyed out.
-    image: Image,
-    /// The color made transparent, if any.
-    transparent: Option<[u8; 3]>,
-    x: i32,
-    y: i32,
-    /// GPU textures for `image`, split so no texture exceeds GPU limits.
-    chunks: Vec<(IRect, TextureHandle)>,
-}
-
-impl Floating {
-    fn new(original: Image, x: i32, y: i32, transparent: Option<[u8; 3]>) -> Self {
-        let mut f = Self {
-            image: original.clone(),
-            original,
-            transparent: None,
-            x,
-            y,
-            chunks: Vec::new(),
-        };
-        f.set_transparent(transparent);
-        f
-    }
-
-    fn set_transparent(&mut self, key: Option<[u8; 3]>) {
-        if key == self.transparent {
-            return;
-        }
-        self.transparent = key;
-        self.image = match key {
-            Some(key) => canvas::color_to_transparent(&self.original, key),
-            None => self.original.clone(),
-        };
-        self.chunks.clear();
-    }
-
-    fn rect(&self) -> IRect {
-        IRect {
-            x0: self.x,
-            y0: self.y,
-            x1: self.x + self.image.width as i32,
-            y1: self.y + self.image.height as i32,
-        }
-    }
 }
 
 const PALETTE: [Color32; 12] = [
@@ -437,6 +394,7 @@ impl eframe::App for PaintApp {
         self.layers_window(&ctx);
         self.settings_window(&ctx);
         self.poll_dialog(&ctx);
+        self.transform_bar(&ctx);
         self.confirm_window(&ctx);
         self.message_popup(&ctx);
         self.update_title(&ctx);
@@ -465,8 +423,8 @@ impl PaintApp {
         if self.text_edit.take().is_some() {
             return;
         }
-        // Undoing right after a paste just drops the pasted image.
-        if self.floating.take().is_some() {
+        // Undoing while a paste or lifted selection floats drops it.
+        if self.cancel_floating() {
             return;
         }
         self.finish_gesture();
@@ -571,11 +529,11 @@ impl PaintApp {
             && self.grid.take().is_none()
             && self.polyline.take().is_none()
             && self.ngon_start.take().is_none()
-            && self.floating.take().is_none()
+            && !self.cancel_floating()
         {
             self.selection = None;
         }
-        if delete && self.floating.take().is_none() {
+        if delete && !self.discard_floating() {
             self.delete_selection();
         }
 
@@ -586,7 +544,7 @@ impl PaintApp {
                 egui::Event::Copy => self.copy(ctx, false),
                 egui::Event::Cut => {
                     self.copy(ctx, false);
-                    if self.floating.take().is_none() {
+                    if !self.discard_floating() {
                         self.delete_selection();
                     }
                 }
@@ -1243,7 +1201,7 @@ impl PaintApp {
                             self.place_floating();
                         }
                         if ui.button("Cancel").on_hover_text("Esc").clicked() {
-                            self.floating = None;
+                            self.cancel_floating();
                         }
                     });
                 }
@@ -1406,25 +1364,185 @@ impl PaintApp {
         let x = (center[0] - image.width as f32 / 2.0).round() as i32;
         let y = (center[1] - image.height as f32 / 2.0).round() as i32;
         let key = self.paste_transparent_color();
-        self.floating = Some(Floating::new(image, x, y, key));
+        self.floating = Some(Floating::pasted(image, x, y, key));
         self.selection = None;
     }
 
-    /// Commits the floating image onto the active layer.
+    /// Commits the floating piece onto the active layer. For a lifted
+    /// selection, lifting and placing become one undo step.
     fn place_floating(&mut self) {
         let Some(f) = self.floating.take() else {
             return;
         };
-        let mut op = PaintOp::new(
-            self.active_layer_id(),
-            PaintMode::Paint {
-                color: [0; 4],
-                opacity: 1.0,
-            },
-        );
-        op.blit(&mut self.layers[self.active], &f.image, f.x, f.y);
-        self.commit(op);
-        self.selection = Some(f.rect());
+        let layer_id = self.active_layer_id();
+        let mode = PaintMode::Paint {
+            color: [0; 4],
+            opacity: 1.0,
+        };
+        let mut op = PaintOp::new(layer_id, mode);
+        op.blit(&mut self.layers[self.active], &f.image, f.x(), f.y());
+        let mut tiles = op.finish().unwrap_or_default();
+        let placed = f.rect();
+        match f.lifted {
+            Some((lifted_from, lifted)) if lifted_from == layer_id => {
+                // The tiles' state from before the lift wins over the
+                // in-between state the blit recorded.
+                let keys: std::collections::HashSet<TileKey> =
+                    lifted.iter().map(|(k, _)| *k).collect();
+                tiles.retain(|(k, _)| !keys.contains(k));
+                tiles.extend(lifted);
+                self.push_tiles(layer_id, tiles);
+            }
+            Some((lifted_from, lifted)) => {
+                self.push_tiles(lifted_from, lifted);
+                self.push_tiles(layer_id, tiles);
+            }
+            None => self.push_tiles(layer_id, tiles),
+        }
+        self.selection = Some(placed);
+    }
+
+    fn push_tiles(&mut self, layer_id: LayerId, tiles: Vec<(TileKey, Option<Vec<canvas::Rgba>>)>) {
+        if !tiles.is_empty() {
+            self.history.push(Action::Tiles {
+                layer_id,
+                tiles,
+                default: None,
+            });
+        }
+    }
+
+    /// Drops the floating piece, putting a lifted selection back where it was.
+    fn cancel_floating(&mut self) -> bool {
+        let Some(f) = self.floating.take() else {
+            return false;
+        };
+        if let Some((layer_id, lifted)) = f.lifted
+            && let Some(layer) = self.layers.iter_mut().find(|l| l.id == layer_id)
+        {
+            for (key, tile) in lifted {
+                layer.swap_tile(key, tile);
+            }
+        }
+        true
+    }
+
+    /// Drops the floating piece for good (Delete / Cut): a lifted selection
+    /// stays removed from its layer, as an undoable edit.
+    fn discard_floating(&mut self) -> bool {
+        let Some(f) = self.floating.take() else {
+            return false;
+        };
+        if let Some((layer_id, lifted)) = f.lifted {
+            self.push_tiles(layer_id, lifted);
+        }
+        true
+    }
+
+    /// Cuts the active selection out of its layer into a floating piece, so
+    /// it can be moved and transformed.
+    fn lift_selection(&mut self) -> bool {
+        let Some(sel) = self.active_selection() else {
+            return false;
+        };
+        let layer = &mut self.layers[self.active];
+        let image = canvas::copy_region(layer, sel);
+        let mut op = PaintOp::new(layer.id, PaintMode::Erase { strength: 1.0 });
+        op.apply(layer, sel, |_, _| 1.0);
+        let undo = op.finish().unwrap_or_default();
+        self.floating = Some(Floating::lifted(image, sel.x0, sel.y0, layer.id, undo));
+        self.selection = None;
+        true
+    }
+
+    /// The box the transform handles sit on: the floating piece, or the
+    /// selection while the Select tool is active.
+    fn transform_frame(&self) -> Option<Frame> {
+        match (&self.floating, self.active_selection()) {
+            (Some(f), _) => Some(f.frame()),
+            (None, Some(sel)) if sel.width() > 0 && sel.height() > 0 => Some(Frame::of_rect(sel)),
+            _ => None,
+        }
+    }
+
+    /// The transform handle under screen point `pos`, if any.
+    fn handle_at(&self, rect: Rect, pos: Pos2) -> Option<Handle> {
+        let frame = self.transform_frame()?;
+        frame
+            .handles(self.scale())
+            .into_iter()
+            .find(|(_, at)| self.to_screen(rect, *at).distance(pos) <= 8.0)
+            .map(|(h, _)| h)
+    }
+
+    /// Applies `m` (in screen orientation) on top of the current transform,
+    /// lifting the selection first if nothing floats yet.
+    fn transform_by(&mut self, m: canvas::Matrix) {
+        if self.floating.is_none() && !self.lift_selection() {
+            return;
+        }
+        if let Some(f) = &mut self.floating {
+            f.set_matrix(canvas::mat_mul(m, f.matrix));
+        }
+    }
+
+    /// Mirror and quarter-turn buttons under the floating piece or selection.
+    fn transform_bar(&mut self, ctx: &egui::Context) {
+        let Some(frame) = self.transform_frame() else {
+            return;
+        };
+        if matches!(
+            self.gesture,
+            Some(Gesture::Transform { .. } | Gesture::MoveFloating { .. } | Gesture::Select { .. })
+        ) {
+            return;
+        }
+        let rect = self.canvas_rect;
+        let corners = frame.corners().map(|c| self.to_screen(rect, c));
+        let bottom = corners.iter().map(|c| c.y).fold(f32::MIN, f32::max);
+        let cx = corners.iter().map(|c| c.x).sum::<f32>() / 4.0;
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let actions: [(Icon, &str, canvas::Matrix); 4] = [
+            (
+                Icon::FlipHorizontal,
+                "Mirror left ↔ right",
+                [-1.0, 0.0, 0.0, 1.0],
+            ),
+            (
+                Icon::FlipVertical,
+                "Mirror top ↕ bottom",
+                [1.0, 0.0, 0.0, -1.0],
+            ),
+            (
+                Icon::RotateLeft,
+                "Rotate 90° left",
+                canvas::rotation(-quarter),
+            ),
+            (
+                Icon::RotateRight,
+                "Rotate 90° right",
+                canvas::rotation(quarter),
+            ),
+        ];
+        let mut picked = None;
+        egui::Area::new(egui::Id::unique("transform_bar"))
+            .order(egui::Order::Foreground)
+            .pivot(Align2::CENTER_TOP)
+            .fixed_pos(Pos2::new(cx, bottom + 10.0))
+            .show(ctx, |ui| {
+                egui::Frame::menu(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (icon, tip, m) in actions {
+                            if icon_button(ui, icon, false).on_hover_text(tip).clicked() {
+                                picked = Some(m);
+                            }
+                        }
+                    });
+                });
+            });
+        if let Some(m) = picked {
+            self.transform_by(m);
+        }
     }
 
     // ----- Canvas -----
@@ -1769,6 +1887,7 @@ impl PaintApp {
         let p = self.to_canvas(rect, pos);
         let scale = self.scale();
         let size = self.brush().size;
+        let snap = self.square_held();
         let mut resized = None;
         let select_end = match &self.gesture {
             Some(Gesture::Select { start }) => Some(self.rect_end(*start, p)),
@@ -1791,8 +1910,17 @@ impl PaintApp {
             }
             Some(Gesture::MoveFloating { grab }) => {
                 if let Some(f) = &mut self.floating {
-                    f.x = (p[0] - grab[0]).round() as i32;
-                    f.y = (p[1] - grab[1]).round() as i32;
+                    f.center = [p[0] - grab[0], p[1] - grab[1]];
+                }
+            }
+            Some(Gesture::Transform {
+                handle,
+                start,
+                frame,
+            }) => {
+                let m = frame.drag(*handle, *start, p, snap);
+                if let Some(f) = &mut self.floating {
+                    f.set_matrix(m);
                 }
             }
             Some(Gesture::Resize { anchor, start_size }) => {
@@ -1855,14 +1983,37 @@ impl PaintApp {
     fn begin_tool(&mut self, rect: Rect, pos: Pos2) {
         let brush = self.brush();
         let p = self.to_canvas(rect, pos);
+        if let Some(handle) = self.handle_at(rect, pos) {
+            if self.floating.is_some() || self.lift_selection() {
+                let frame = self.floating.as_ref().expect("lifted above").frame();
+                self.gesture = Some(Gesture::Transform {
+                    handle,
+                    start: p,
+                    frame,
+                });
+            }
+            return;
+        }
         if let Some(f) = &self.floating {
-            let (x, y) = (p[0].floor() as i32, p[1].floor() as i32);
-            if f.rect().contains(x, y) {
-                let grab = [p[0] - f.x as f32, p[1] - f.y as f32];
+            if f.frame().contains(p) {
+                let grab = [p[0] - f.center[0], p[1] - f.center[1]];
                 self.gesture = Some(Gesture::MoveFloating { grab });
             } else {
-                // Clicking elsewhere drops the pasted image in place.
+                // Clicking elsewhere drops the floating piece in place.
                 self.place_floating();
+            }
+            return;
+        }
+        if self.tool == Tool::Select
+            && self
+                .active_selection()
+                .is_some_and(|sel| Frame::of_rect(sel).contains(p))
+        {
+            // Dragging the selection moves its pixels.
+            self.lift_selection();
+            if let Some(f) = &self.floating {
+                let grab = [p[0] - f.center[0], p[1] - f.center[1]];
+                self.gesture = Some(Gesture::MoveFloating { grab });
             }
             return;
         }
@@ -2028,7 +2179,12 @@ impl PaintApp {
                     self.selection = None;
                 }
             }
-            Some(Gesture::MoveFloating { .. } | Gesture::Resize { .. } | Gesture::Pan { .. })
+            Some(
+                Gesture::MoveFloating { .. }
+                | Gesture::Transform { .. }
+                | Gesture::Resize { .. }
+                | Gesture::Pan { .. },
+            )
             | None => {}
         }
     }
@@ -2300,22 +2456,31 @@ impl PaintApp {
             if index == self.active
                 && let Some(f) = &self.floating
             {
+                let (fx, fy) = (f.x(), f.y());
                 for (chunk, tex) in &f.chunks {
                     let r = IRect {
-                        x0: f.x + chunk.x0,
-                        y0: f.y + chunk.y0,
-                        x1: f.x + chunk.x1,
-                        y1: f.y + chunk.y1,
+                        x0: fx + chunk.x0,
+                        y0: fy + chunk.y0,
+                        x1: fx + chunk.x1,
+                        y1: fy + chunk.y1,
                     };
                     painter.image(tex.id(), self.screen_rect_of(rect, r), uv, Color32::WHITE);
                 }
             }
         }
 
-        if let Some(f) = &self.floating {
-            marching_ants(&painter, self.screen_rect_of(rect, f.rect()));
-        } else if let Some(sel) = self.active_selection() {
-            marching_ants(&painter, self.screen_rect_of(rect, sel));
+        if let Some(frame) = self.transform_frame() {
+            let corners = frame.corners().map(|c| self.to_screen(rect, c));
+            marching_ants_polygon(&painter, &corners);
+            let selecting = matches!(self.gesture, Some(Gesture::Select { .. }));
+            if !selecting {
+                paint_handles(
+                    &painter,
+                    &frame
+                        .handles(self.scale())
+                        .map(|(h, at)| (h, self.to_screen(rect, at))),
+                );
+            }
         }
 
         let outline = Stroke::new(1.0, Color32::from_gray(120));
@@ -2429,11 +2594,29 @@ impl PaintApp {
         // Cursor under the pointer.
         if let Some(pos) = response.hover_pos() {
             let p = self.to_canvas(rect, pos);
-            let over_floating = self
+            let handle = match &self.gesture {
+                Some(Gesture::Transform { handle, .. }) => Some(*handle),
+                None => self.handle_at(rect, pos),
+                _ => None,
+            };
+            if let Some(handle) = handle {
+                ui.ctx().set_cursor_icon(match handle {
+                    Handle::Rotate => CursorIcon::Grab,
+                    Handle::SkewTop | Handle::SkewBottom => CursorIcon::ResizeHorizontal,
+                    Handle::SkewLeft | Handle::SkewRight => CursorIcon::ResizeVertical,
+                });
+                return;
+            }
+            let over_piece = self
                 .floating
                 .as_ref()
-                .is_some_and(|f| f.rect().contains(p[0].floor() as i32, p[1].floor() as i32));
-            if over_floating || matches!(self.gesture, Some(Gesture::MoveFloating { .. })) {
+                .is_some_and(|f| f.frame().contains(p))
+                || (self.tool == Tool::Select
+                    && self.gesture.is_none()
+                    && self
+                        .active_selection()
+                        .is_some_and(|sel| Frame::of_rect(sel).contains(p)));
+            if over_piece || matches!(self.gesture, Some(Gesture::MoveFloating { .. })) {
                 ui.ctx().set_cursor_icon(CursorIcon::Move);
                 return;
             }
@@ -2685,6 +2868,49 @@ fn swatch(painter: &egui::Painter, rect: Rect, color: Color32) {
         );
     } else {
         painter.rect_filled(rect, 2.0, color);
+    }
+}
+
+/// Draws a closed selection outline through screen points.
+fn marching_ants_polygon(painter: &egui::Painter, corners: &[Pos2]) {
+    let mut pts = corners.to_vec();
+    pts.push(corners[0]);
+    painter.add(Shape::line(pts.clone(), Stroke::new(1.0, Color32::WHITE)));
+    painter.extend(Shape::dashed_line(
+        &pts,
+        Stroke::new(1.0, Color32::BLACK),
+        4.0,
+        4.0,
+    ));
+}
+
+/// Draws transform handles: a round rotate handle on a stalk, diamonds for skew.
+fn paint_handles(painter: &egui::Painter, handles: &[(Handle, Pos2)]) {
+    let fill = Color32::WHITE;
+    let line = Stroke::new(1.0, Color32::from_gray(60));
+    let top = handles
+        .iter()
+        .find(|(h, _)| *h == Handle::SkewTop)
+        .map(|(_, p)| *p);
+    for &(handle, at) in handles {
+        if handle == Handle::Rotate {
+            if let Some(top) = top {
+                painter.line_segment([top, at], line);
+            }
+            painter.circle(at, 5.5, fill, line);
+        } else {
+            let r = 5.0;
+            painter.add(Shape::convex_polygon(
+                vec![
+                    at + Vec2::new(0.0, -r),
+                    at + Vec2::new(r, 0.0),
+                    at + Vec2::new(0.0, r),
+                    at + Vec2::new(-r, 0.0),
+                ],
+                fill,
+                line,
+            ));
+        }
     }
 }
 
