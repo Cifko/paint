@@ -104,8 +104,6 @@ const SHAPE_KEYS: [(Key, ShapeKind); 4] = [
 /// A polyline being clicked out point by point.
 struct Polyline {
     points: Vec<[f32; 2]>,
-    /// Whether it was started with the right mouse button (color 2).
-    secondary: bool,
 }
 
 /// A shape rendered into the preview layer.
@@ -1510,11 +1508,9 @@ impl PaintApp {
     /// Adds a polyline point; clicking the last point again (a double click)
     /// finishes it, clicking the first point closes it.
     fn polyline_click(&mut self, rect: Rect, p: [f32; 2]) {
-        let secondary = self.use_secondary;
         let Some(poly) = &self.polyline else {
             self.polyline = Some(Polyline {
                 points: vec![pixel_center(p)],
-                secondary,
             });
             return;
         };
@@ -1545,8 +1541,6 @@ impl PaintApp {
         if poly.points.len() < 2 {
             return;
         }
-        // Use the color the polyline was started with.
-        let secondary = std::mem::replace(&mut self.use_secondary, poly.secondary);
         let mut op = PaintOp::new(
             self.active_layer_id(),
             self.color_mode(self.paint_brush.opacity),
@@ -1556,7 +1550,6 @@ impl PaintApp {
             &poly.points,
             self.paint_brush.size,
         );
-        self.use_secondary = secondary;
         self.commit(op);
     }
 
@@ -1672,7 +1665,11 @@ impl PaintApp {
                         PointerButton::Primary if space => Some(Gesture::Pan { button, last: pos }),
                         PointerButton::Primary | PointerButton::Secondary => {
                             // Like MS Paint: the right button paints with color 2.
-                            self.use_secondary = button == PointerButton::Secondary;
+                            // Shapes built from several clicks (polyline, grid) keep
+                            // the color of their first click.
+                            if self.polyline.is_none() && self.grid.is_none() {
+                                self.use_secondary = button == PointerButton::Secondary;
+                            }
                             self.gesture_button = button;
                             self.begin_tool(rect, pos);
                             None
