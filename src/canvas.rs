@@ -281,6 +281,63 @@ impl PaintOp {
         });
     }
 
+    /// Draws a convex polygon, filled or outlined with a line of `width`
+    /// centered on its edges (with sharp corners).
+    pub fn polygon(&mut self, layer: &mut Layer, pts: &[[f32; 2]], width: f32, filled: bool) {
+        if pts.len() < 3 {
+            return;
+        }
+        let half = (width / 2.0).max(0.5);
+        // Clockwise or not, make every edge normal point outwards.
+        let area2: f32 = (0..pts.len())
+            .map(|i| {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                a[0] * b[1] - b[0] * a[1]
+            })
+            .sum();
+        let sign = if area2 > 0.0 { 1.0 } else { -1.0 };
+        let edges: Vec<([f32; 2], [f32; 2])> = (0..pts.len())
+            .map(|i| {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let len = dx.hypot(dy).max(1e-6);
+                (a, [sign * dy / len, -sign * dx / len])
+            })
+            .collect();
+        let grow = if filled { 1.0 } else { half * 3.0 };
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in pts {
+            (x0, y0, x1, y1) = (x0.min(p[0]), y0.min(p[1]), x1.max(p[0]), y1.max(p[1]));
+        }
+        let area = bbox(x0 - grow, y0 - grow, x1 + grow, y1 + grow);
+        self.apply(layer, area, |x, y| {
+            // Signed distance to the nearest edge's line (negative inside);
+            // outside a corner this gives a sharp, mitred tip.
+            let d = edges
+                .iter()
+                .map(|(a, n)| (x - a[0]) * n[0] + (y - a[1]) * n[1])
+                .fold(f32::MIN, f32::max);
+            if filled {
+                coverage(-d)
+            } else {
+                coverage(half - d.abs())
+            }
+        });
+    }
+
+    /// Draws connected line segments of `width` with round ends and joins.
+    pub fn polyline(&mut self, layer: &mut Layer, pts: &[[f32; 2]], width: f32) {
+        match pts {
+            [] => {}
+            [p] => self.stroke_segment(layer, *p, *p, width / 2.0),
+            _ => {
+                for w in pts.windows(2) {
+                    self.stroke_segment(layer, w[0], w[1], width / 2.0);
+                }
+            }
+        }
+    }
+
     /// Draws the lines of a `cols`×`rows` grid of `cell`-sized cells whose
     /// top-left corner is `origin`.
     pub fn grid(
@@ -479,6 +536,76 @@ pub fn rect_from_corners(a: [i32; 2], b: [i32; 2]) -> IRect {
         x1: a[0].max(b[0]),
         y1: a[1].max(b[1]),
     }
+}
+
+/// What the Shape tool draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeKind {
+    Rectangle,
+    Ellipse,
+    Triangle,
+    Line,
+    Polyline,
+}
+
+impl ShapeKind {
+    pub const ALL: [ShapeKind; 5] = [
+        Self::Rectangle,
+        Self::Ellipse,
+        Self::Triangle,
+        Self::Line,
+        Self::Polyline,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rectangle => "Rectangle",
+            Self::Ellipse => "Ellipse",
+            Self::Triangle => "Triangle",
+            Self::Line => "Line",
+            Self::Polyline => "Polyline",
+        }
+    }
+
+    /// Whether the shape is drawn by dragging out a bounding box.
+    pub fn is_boxed(self) -> bool {
+        matches!(self, Self::Rectangle | Self::Ellipse | Self::Triangle)
+    }
+
+    /// Height / width when snapped to a regular shape (square, circle,
+    /// equilateral triangle).
+    pub fn regular_ratio(self) -> f32 {
+        match self {
+            Self::Triangle => 3f32.sqrt() / 2.0,
+            _ => 1.0,
+        }
+    }
+}
+
+/// Corners of the triangle filling `r`: apex at the top middle, base along the bottom.
+pub fn triangle_points(r: IRect) -> [[f32; 2]; 3] {
+    let mid = (r.x0 + r.x1) as f32 / 2.0;
+    [
+        [mid, r.y0 as f32],
+        [r.x1 as f32, r.y1 as f32],
+        [r.x0 as f32, r.y1 as f32],
+    ]
+}
+
+/// Moves `end` so the line from `start` points in a multiple of 45°.
+pub fn snap_angle(start: [f32; 2], end: [f32; 2]) -> [f32; 2] {
+    let (dx, dy) = (end[0] - start[0], end[1] - start[1]);
+    let step = std::f32::consts::FRAC_PI_4;
+    let angle = (dy.atan2(dx) / step).round() * step;
+    // Keep the drag's extent along the chosen direction.
+    let len = if angle.cos().abs() > 0.9 {
+        dx.abs()
+    } else if angle.sin().abs() > 0.9 {
+        dy.abs()
+    } else {
+        dx.abs().max(dy.abs()) * std::f32::consts::SQRT_2
+    };
+    [start[0] + len * angle.cos(), start[1] + len * angle.sin()]
 }
 
 /// Shape of the cells drawn by the grid tool.
@@ -1560,5 +1687,54 @@ mod tests {
         let (tl, cols, rows) = GridKind::Triangle.layout([100, 100], [10, 9], [65, 80]);
         assert_eq!((cols, rows), (6, 2));
         assert_eq!(tl, [65.0, 82.0]);
+    }
+
+    #[test]
+    fn triangle_outline_and_fill() {
+        let r = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 40,
+            y1: 30,
+        };
+        let pts = triangle_points(r);
+        let mut layer = Layer::new(1, "L");
+        let mut op = PaintOp::new(1, paint(RED));
+        op.polygon(&mut layer, &pts, 2.0, false);
+        assert_eq!(layer.pixel(20, 29), RED, "base");
+        assert_eq!(layer.pixel(20, 0), RED, "apex");
+        assert_eq!(layer.pixel(20, 20), [0; 4], "hollow inside");
+        assert_eq!(layer.pixel(2, 2), [0; 4], "outside the slanted side");
+        let mut op = PaintOp::new(1, paint(RED));
+        op.polygon(&mut layer, &pts, 2.0, true);
+        assert_eq!(layer.pixel(20, 20), RED);
+        assert_eq!(layer.pixel(2, 2), [0; 4]);
+    }
+
+    #[test]
+    fn polyline_joins_segments() {
+        let mut layer = Layer::new(1, "L");
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: RED,
+                opacity: 0.5,
+            },
+        );
+        op.polyline(&mut layer, &[[0.5, 0.5], [20.5, 0.5], [20.5, 20.5]], 3.0);
+        assert_eq!(layer.pixel(10, 0)[3], 128);
+        assert_eq!(layer.pixel(20, 10)[3], 128);
+        assert_eq!(layer.pixel(20, 0)[3], 128, "the joint isn't painted twice");
+        assert_eq!(layer.pixel(10, 10), [0; 4]);
+    }
+
+    #[test]
+    fn line_angle_snapping() {
+        let s = snap_angle([0.0, 0.0], [100.0, 10.0]);
+        assert!((s[0] - 100.0).abs() < 1e-3 && s[1].abs() < 1e-3);
+        let s = snap_angle([0.0, 0.0], [50.0, 60.0]);
+        assert!((s[0] - s[1]).abs() < 1e-3, "diagonal: {s:?}");
+        let s = snap_angle([0.0, 0.0], [-3.0, -80.0]);
+        assert!(s[0].abs() < 1e-3 && (s[1] + 80.0).abs() < 1e-3);
     }
 }

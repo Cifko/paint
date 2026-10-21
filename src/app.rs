@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 
 use crate::canvas::{
-    self, GridKind, IRect, Image, Layer, LayerId, PaintMode, PaintOp, TILE, TileKey,
+    self, GridKind, IRect, Image, Layer, LayerId, PaintMode, PaintOp, ShapeKind, TILE, TileKey,
 };
 use crate::file;
 use crate::history::{Action, History};
@@ -22,20 +22,18 @@ enum Tool {
     Brush,
     Eraser,
     Fill,
-    Rectangle,
-    Ellipse,
+    Shape,
     Grid,
     Select,
     Text,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, Key, Icon); 8] = [
+    const ALL: [(Tool, &'static str, Key, Icon); 7] = [
         (Tool::Brush, "Brush", Key::B, Icon::Brush),
         (Tool::Eraser, "Eraser", Key::E, Icon::Eraser),
         (Tool::Fill, "Fill", Key::G, Icon::Fill),
-        (Tool::Rectangle, "Rectangle", Key::R, Icon::Rectangle),
-        (Tool::Ellipse, "Ellipse", Key::C, Icon::Ellipse),
+        (Tool::Shape, "Shape", Key::S, Icon::Rectangle),
         (Tool::Grid, "Grid", Key::H, Icon::Grid),
         (Tool::Select, "Select", Key::M, Icon::Select),
         (Tool::Text, "Text", Key::T, Icon::Text),
@@ -59,10 +57,8 @@ struct TextEdit {
 /// What the preview layer currently shows.
 #[derive(Clone, Debug, PartialEq)]
 enum PreviewKey {
-    Ellipse {
-        rect: IRect,
-        size: f32,
-        filled: bool,
+    Shape {
+        shape: ShapeSpec,
         color: [u8; 4],
         opacity: f32,
     },
@@ -97,6 +93,47 @@ enum PendingAction {
     Open(PathBuf),
 }
 
+/// Shortcut keys that pick a shape (and the Shape tool).
+const SHAPE_KEYS: [(Key, ShapeKind); 4] = [
+    (Key::R, ShapeKind::Rectangle),
+    (Key::C, ShapeKind::Ellipse),
+    (Key::L, ShapeKind::Line),
+    (Key::P, ShapeKind::Polyline),
+];
+
+/// A polyline being clicked out point by point.
+struct Polyline {
+    points: Vec<[f32; 2]>,
+    /// Whether it was started with the right mouse button (color 2).
+    secondary: bool,
+}
+
+/// A shape rendered into the preview layer.
+#[derive(Clone, Debug, PartialEq)]
+enum ShapeSpec {
+    Ellipse(IRect, f32, bool),
+    Triangle(IRect, f32, bool),
+    Polyline(Vec<[f32; 2]>, f32),
+}
+
+impl ShapeSpec {
+    fn draw(&self, op: &mut PaintOp, layer: &mut Layer) {
+        match self {
+            Self::Ellipse(r, size, filled) => {
+                if r.width() > 0 && r.height() > 0 {
+                    op.ellipse(layer, *r, *size, *filled);
+                }
+            }
+            Self::Triangle(r, size, filled) => {
+                if r.width() > 0 && r.height() > 0 {
+                    op.polygon(layer, &canvas::triangle_points(*r), *size, *filled);
+                }
+            }
+            Self::Polyline(points, size) => op.polyline(layer, points, *size),
+        }
+    }
+}
+
 /// Progress of the click-by-click grid tool.
 #[derive(Clone, Copy, Debug)]
 enum GridState {
@@ -112,11 +149,12 @@ enum Gesture {
         op: PaintOp,
         last: [f32; 2],
     },
-    Ellipse {
+    /// Dragging out a rectangle, ellipse or triangle.
+    Shape {
         start: [i32; 2],
     },
-    Rectangle {
-        start: [i32; 2],
+    Line {
+        start: [f32; 2],
     },
     Select {
         start: [i32; 2],
@@ -246,6 +284,8 @@ pub struct PaintApp {
     text_face: FontFace,
     grid: Option<GridState>,
     grid_kind: GridKind,
+    shape_kind: ShapeKind,
+    polyline: Option<Polyline>,
 
     /// Where the image was last opened from / saved to.
     file_path: Option<PathBuf>,
@@ -332,6 +372,8 @@ impl PaintApp {
             text_face: FontFace::Sans,
             grid: None,
             grid_kind: GridKind::Rectangle,
+            shape_kind: ShapeKind::Rectangle,
+            polyline: None,
             file_path: None,
             saved_version: 0,
             pending: None,
@@ -370,6 +412,9 @@ impl eframe::App for PaintApp {
         if self.tool != Tool::Text {
             self.commit_text();
         }
+        if self.tool != Tool::Shape || self.shape_kind != ShapeKind::Polyline {
+            self.finish_polyline();
+        }
         self.shortcuts(&ctx);
         let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
         if let Some(path) = dropped {
@@ -398,6 +443,14 @@ impl PaintApp {
     }
 
     fn undo(&mut self) {
+        // While clicking out a polyline, undo takes back its last point.
+        if let Some(poly) = &mut self.polyline {
+            poly.points.pop();
+            if poly.points.is_empty() {
+                self.polyline = None;
+            }
+            return;
+        }
         // Undoing while typing drops the text that isn't placed yet.
         if self.text_edit.take().is_some() {
             return;
@@ -481,6 +534,12 @@ impl PaintApp {
                 self.tool = tool;
             }
         }
+        for (key, kind) in SHAPE_KEYS {
+            if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key)) {
+                self.tool = Tool::Shape;
+                self.shape_kind = kind;
+            }
+        }
 
         if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::X)) {
             std::mem::swap(&mut self.primary, &mut self.secondary);
@@ -494,9 +553,15 @@ impl PaintApp {
         });
         if enter {
             self.place_floating();
+            self.finish_polyline();
         }
-        // Esc cancels an unfinished grid or paste first, otherwise clears the selection.
-        if escape && self.grid.take().is_none() && self.floating.take().is_none() {
+        // Esc cancels an unfinished grid, polyline or paste first, otherwise
+        // clears the selection.
+        if escape
+            && self.grid.take().is_none()
+            && self.polyline.take().is_none()
+            && self.floating.take().is_none()
+        {
             self.selection = None;
         }
         if delete && self.floating.take().is_none() {
@@ -897,60 +962,6 @@ impl PaintApp {
         }
     }
 
-    /// The small arrow next to the grid button, opening a list of grid shapes.
-    fn grid_kind_dropdown(&mut self, ui: &mut egui::Ui) {
-        let (rect, arrow) = ui.allocate_exact_size(Vec2::new(12.0, 28.0), Sense::click());
-        let arrow = arrow.on_hover_text("Grid shape");
-        let color = if arrow.hovered() {
-            ui.visuals().strong_text_color()
-        } else {
-            ui.visuals().text_color()
-        };
-        let c = rect.center();
-        ui.painter().add(Shape::convex_polygon(
-            vec![
-                c + Vec2::new(-4.0, -2.0),
-                c + Vec2::new(4.0, -2.0),
-                c + Vec2::new(0.0, 3.0),
-            ],
-            color,
-            Stroke::NONE,
-        ));
-        egui::Popup::menu(&arrow).show(|ui| {
-            for kind in GridKind::ALL {
-                let (row, resp) = ui.allocate_exact_size(Vec2::new(140.0, 26.0), Sense::click());
-                let visuals = ui.visuals();
-                if kind == self.grid_kind || resp.hovered() {
-                    let fill = if kind == self.grid_kind {
-                        visuals.selection.bg_fill
-                    } else {
-                        visuals.widgets.hovered.weak_bg_fill
-                    };
-                    ui.painter().rect_filled(row, 4.0, fill);
-                }
-                let text_color = visuals.text_color();
-                let icon_rect =
-                    Rect::from_min_size(row.min + Vec2::new(4.0, 3.0), Vec2::splat(20.0));
-                icons::paint(ui.painter(), icon_rect, grid_icon(kind), text_color);
-                ui.painter().text(
-                    row.left_center() + Vec2::new(30.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    kind.label(),
-                    egui::FontId::proportional(14.0),
-                    text_color,
-                );
-                if resp.clicked() {
-                    if self.grid_kind != kind {
-                        self.grid = None;
-                    }
-                    self.grid_kind = kind;
-                    self.tool = Tool::Grid;
-                    ui.close();
-                }
-            }
-        });
-    }
-
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("File", |ui| {
@@ -977,11 +988,11 @@ impl PaintApp {
             });
             ui.separator();
             for (tool, name, key, icon) in Tool::ALL {
-                // The grid button shows the chosen grid shape.
-                let icon = if tool == Tool::Grid {
-                    grid_icon(self.grid_kind)
-                } else {
-                    icon
+                // The grid and shape buttons show the chosen kind.
+                let icon = match tool {
+                    Tool::Grid => grid_icon(self.grid_kind),
+                    Tool::Shape => shape_icon(self.shape_kind),
+                    _ => icon,
                 };
                 if icon_button(ui, icon, self.tool == tool)
                     .on_hover_text(format!("{name} ({})", key.name()))
@@ -989,8 +1000,34 @@ impl PaintApp {
                 {
                     self.tool = tool;
                 }
-                if tool == Tool::Grid {
-                    self.grid_kind_dropdown(ui);
+                if tool == Tool::Grid
+                    && let Some(kind) = kind_dropdown(
+                        ui,
+                        "Grid shape",
+                        &GridKind::ALL,
+                        self.grid_kind,
+                        grid_icon,
+                        GridKind::label,
+                    )
+                {
+                    if self.grid_kind != kind {
+                        self.grid = None;
+                    }
+                    self.grid_kind = kind;
+                    self.tool = Tool::Grid;
+                }
+                if tool == Tool::Shape
+                    && let Some(kind) = kind_dropdown(
+                        ui,
+                        "Shape",
+                        &ShapeKind::ALL,
+                        self.shape_kind,
+                        shape_icon,
+                        ShapeKind::label,
+                    )
+                {
+                    self.shape_kind = kind;
+                    self.tool = Tool::Shape;
                 }
             }
             ui.separator();
@@ -1131,9 +1168,16 @@ impl PaintApp {
                         ui.label("Tolerance");
                         ui.add(egui::DragValue::new(&mut self.fill_tolerance).range(0..=255));
                     }
-                    Tool::Ellipse | Tool::Rectangle => {
+                    Tool::Shape if self.shape_kind.is_boxed() => {
                         ui.separator();
                         ui.checkbox(&mut self.fill_shapes, "Filled");
+                    }
+                    Tool::Shape if self.shape_kind == ShapeKind::Polyline => {
+                        ui.separator();
+                        ui.small(
+                            "Click to add points. Double-click or Enter to finish; \
+                             click the first point to close.",
+                        );
                     }
                     Tool::Text => {
                         ui.separator();
@@ -1428,11 +1472,22 @@ impl PaintApp {
     /// Corner of a grid cell under `p`; with the snap key held the cell
     /// becomes regular (square, equilateral triangle, regular hexagon).
     fn cell_end(&self, origin: [i32; 2], p: [f32; 2]) -> [i32; 2] {
+        self.regular_end(origin, p, self.grid_kind.regular_ratio())
+    }
+
+    /// Corner of a rectangle, ellipse or triangle's box; with the snap key
+    /// held it becomes a square, circle or equilateral triangle.
+    fn shape_end(&self, origin: [i32; 2], p: [f32; 2]) -> [i32; 2] {
+        self.regular_end(origin, p, self.shape_kind.regular_ratio())
+    }
+
+    /// The pixel corner under `p`; with the snap key held, moved so the box
+    /// from `origin` has height / width `ratio`.
+    fn regular_end(&self, origin: [i32; 2], p: [f32; 2], ratio: f32) -> [i32; 2] {
         let end = [p[0].round() as i32, p[1].round() as i32];
         if !self.square_held() {
             return end;
         }
-        let ratio = self.grid_kind.regular_ratio();
         let (dx, dy) = (end[0] - origin[0], end[1] - origin[1]);
         let w = (dx.abs() as f32).max(dy.abs() as f32 / ratio);
         let sign = |v: i32| if v < 0 { -1.0 } else { 1.0 };
@@ -1440,6 +1495,69 @@ impl PaintApp {
             origin[0] + (sign(dx) * w).round() as i32,
             origin[1] + (sign(dy) * w * ratio).round() as i32,
         ]
+    }
+
+    /// End of a line from `start`, snapped to 45° steps with the snap key.
+    fn line_end(&self, start: [f32; 2], p: [f32; 2]) -> [f32; 2] {
+        let end = pixel_center(p);
+        if self.square_held() {
+            canvas::snap_angle(start, end)
+        } else {
+            end
+        }
+    }
+
+    /// Adds a polyline point; clicking the last point again (a double click)
+    /// finishes it, clicking the first point closes it.
+    fn polyline_click(&mut self, rect: Rect, p: [f32; 2]) {
+        let secondary = self.use_secondary;
+        let Some(poly) = &self.polyline else {
+            self.polyline = Some(Polyline {
+                points: vec![pixel_center(p)],
+                secondary,
+            });
+            return;
+        };
+        let last = *poly.points.last().expect("polylines have a point");
+        let first = poly.points[0];
+        let point = self.line_end(last, p);
+        let near = |a: [f32; 2]| {
+            self.to_screen(rect, a)
+                .distance(self.to_screen(rect, point))
+                < 6.0
+        };
+        if near(last) {
+            self.finish_polyline();
+        } else if poly.points.len() >= 3 && near(first) {
+            if let Some(poly) = &mut self.polyline {
+                poly.points.push(first);
+            }
+            self.finish_polyline();
+        } else if let Some(poly) = &mut self.polyline {
+            poly.points.push(point);
+        }
+    }
+
+    fn finish_polyline(&mut self) {
+        let Some(poly) = self.polyline.take() else {
+            return;
+        };
+        if poly.points.len() < 2 {
+            return;
+        }
+        // Use the color the polyline was started with.
+        let secondary = std::mem::replace(&mut self.use_secondary, poly.secondary);
+        let mut op = PaintOp::new(
+            self.active_layer_id(),
+            self.color_mode(self.paint_brush.opacity),
+        );
+        op.polyline(
+            &mut self.layers[self.active],
+            &poly.points,
+            self.paint_brush.size,
+        );
+        self.use_secondary = secondary;
+        self.commit(op);
     }
 
     fn square_held(&self) -> bool {
@@ -1703,14 +1821,17 @@ impl PaintApp {
                 op.stroke_segment(&mut self.layers[self.active], p, p, brush.size / 2.0);
                 self.gesture = Some(Gesture::Stroke { op, last: p });
             }
-            Tool::Ellipse => {
-                let start = [p[0].round() as i32, p[1].round() as i32];
-                self.gesture = Some(Gesture::Ellipse { start });
-            }
-            Tool::Rectangle => {
-                let start = [p[0].round() as i32, p[1].round() as i32];
-                self.gesture = Some(Gesture::Rectangle { start });
-            }
+            Tool::Shape => match self.shape_kind {
+                ShapeKind::Line => {
+                    let start = pixel_center(p);
+                    self.gesture = Some(Gesture::Line { start });
+                }
+                ShapeKind::Polyline => self.polyline_click(rect, p),
+                _ => {
+                    let start = [p[0].round() as i32, p[1].round() as i32];
+                    self.gesture = Some(Gesture::Shape { start });
+                }
+            },
             Tool::Grid => self.grid_click(p),
             Tool::Text => {
                 // A click finishes any text being typed and starts new text there.
@@ -1790,36 +1911,32 @@ impl PaintApp {
         let brush = self.brush();
         match self.gesture.take() {
             Some(Gesture::Stroke { op, .. }) => self.commit(op),
-            Some(Gesture::Ellipse { start }) => {
+            Some(Gesture::Shape { start }) => {
                 let Some(pos) = pos else { return };
-                let end = self.rect_end(start, self.to_canvas(rect, pos));
-                let r = canvas::rect_from_corners(start, end);
+                let r = canvas::rect_from_corners(
+                    start,
+                    self.shape_end(start, self.to_canvas(rect, pos)),
+                );
                 if r.width() <= 0 || r.height() <= 0 {
                     return;
                 }
                 let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
-                op.ellipse(
-                    &mut self.layers[self.active],
-                    r,
-                    brush.size,
-                    self.fill_shapes,
-                );
+                let layer = &mut self.layers[self.active];
+                match self.shape_kind {
+                    ShapeKind::Rectangle => op.rectangle(layer, r, brush.size, self.fill_shapes),
+                    ShapeKind::Ellipse => op.ellipse(layer, r, brush.size, self.fill_shapes),
+                    _ => {
+                        let pts = canvas::triangle_points(r);
+                        op.polygon(layer, &pts, brush.size, self.fill_shapes);
+                    }
+                }
                 self.commit(op);
             }
-            Some(Gesture::Rectangle { start }) => {
+            Some(Gesture::Line { start }) => {
                 let Some(pos) = pos else { return };
-                let end = self.rect_end(start, self.to_canvas(rect, pos));
-                let r = canvas::rect_from_corners(start, end);
-                if r.width() <= 0 || r.height() <= 0 {
-                    return;
-                }
+                let end = self.line_end(start, self.to_canvas(rect, pos));
                 let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
-                op.rectangle(
-                    &mut self.layers[self.active],
-                    r,
-                    brush.size,
-                    self.fill_shapes,
-                );
+                op.polyline(&mut self.layers[self.active], &[start, end], brush.size);
                 self.commit(op);
             }
             Some(Gesture::Select { .. }) => {
@@ -1927,19 +2044,45 @@ impl PaintApp {
         }
     }
 
-    /// Renders the ellipse being dragged out into the preview layer.
+    fn shape_preview(&self, shape: ShapeSpec) -> PreviewKey {
+        PreviewKey::Shape {
+            shape,
+            color: self.color().to_array(),
+            opacity: self.brush().opacity,
+        }
+    }
+
+    /// Renders the shape or text being drawn into the preview layer.
     fn update_preview(&mut self, ui: &egui::Ui, rect: Rect) {
         let pointer = ui.input(|i| i.pointer.latest_pos());
         let key = match (&self.gesture, pointer, &self.text_edit) {
-            (Some(Gesture::Ellipse { start }), Some(pos), _) => {
-                let end = self.rect_end(*start, self.to_canvas(rect, pos));
-                Some(PreviewKey::Ellipse {
-                    rect: canvas::rect_from_corners(*start, end),
-                    size: self.brush().size,
-                    filled: self.fill_shapes,
-                    color: self.color().to_array(),
-                    opacity: self.brush().opacity,
-                })
+            (Some(Gesture::Shape { start }), Some(pos), _)
+                if self.shape_kind != ShapeKind::Rectangle =>
+            {
+                let r = canvas::rect_from_corners(
+                    *start,
+                    self.shape_end(*start, self.to_canvas(rect, pos)),
+                );
+                let (size, filled) = (self.brush().size, self.fill_shapes);
+                let shape = match self.shape_kind {
+                    ShapeKind::Ellipse => ShapeSpec::Ellipse(r, size, filled),
+                    _ => ShapeSpec::Triangle(r, size, filled),
+                };
+                Some(self.shape_preview(shape))
+            }
+            (Some(Gesture::Line { start }), Some(pos), _) => {
+                let end = self.line_end(*start, self.to_canvas(rect, pos));
+                let shape = ShapeSpec::Polyline(vec![*start, end], self.brush().size);
+                Some(self.shape_preview(shape))
+            }
+            (None, pointer, _) if self.polyline.is_some() => {
+                let poly = self.polyline.as_ref().expect("checked above");
+                let mut points = poly.points.clone();
+                if let Some(pos) = pointer {
+                    let last = *points.last().expect("polylines have a point");
+                    points.push(self.line_end(last, self.to_canvas(rect, pos)));
+                }
+                Some(self.shape_preview(ShapeSpec::Polyline(points, self.brush().size)))
             }
             (_, _, Some(edit)) => Some(PreviewKey::Text {
                 origin: edit.origin,
@@ -1961,14 +2104,7 @@ impl PaintApp {
         };
         let mut op = PaintOp::new(self.preview.id, preview_mode);
         match &key {
-            Some(PreviewKey::Ellipse {
-                rect: r,
-                size,
-                filled,
-                ..
-            }) if r.width() > 0 && r.height() > 0 => {
-                op.ellipse(&mut self.preview, *r, *size, *filled);
-            }
+            Some(PreviewKey::Shape { shape, .. }) => shape.draw(&mut op, &mut self.preview),
             Some(PreviewKey::Text {
                 origin,
                 text,
@@ -2097,19 +2233,25 @@ impl PaintApp {
         if let Some(pos) = pointer {
             let p = self.to_canvas(rect, pos);
             match &self.gesture {
-                Some(Gesture::Rectangle { start }) => {
-                    let r = canvas::rect_from_corners(*start, self.rect_end(*start, p));
-                    let sr = self.screen_rect_of(rect, r);
-                    if self.fill_shapes {
-                        painter.rect_filled(sr, 0.0, color);
-                    } else {
-                        painter.rect_stroke(sr, 0.0, pen, egui::StrokeKind::Middle);
+                Some(Gesture::Shape { start }) => {
+                    let r = canvas::rect_from_corners(*start, self.shape_end(*start, p));
+                    if self.shape_kind == ShapeKind::Rectangle {
+                        let sr = self.screen_rect_of(rect, r);
+                        if self.fill_shapes {
+                            painter.rect_filled(sr, 0.0, color);
+                        } else {
+                            painter.rect_stroke(sr, 0.0, pen, egui::StrokeKind::Middle);
+                        }
                     }
                     info_label(&painter, pos, format!("{} × {}", r.width(), r.height()));
                 }
-                Some(Gesture::Ellipse { start }) => {
-                    let r = canvas::rect_from_corners(*start, self.rect_end(*start, p));
-                    info_label(&painter, pos, format!("{} × {}", r.width(), r.height()));
+                Some(Gesture::Line { start }) => {
+                    info_label(&painter, pos, line_info(*start, self.line_end(*start, p)));
+                }
+                None if self.polyline.is_some() => {
+                    let poly = self.polyline.as_ref().expect("checked above");
+                    let last = *poly.points.last().expect("polylines have a point");
+                    info_label(&painter, pos, line_info(last, self.line_end(last, p)));
                 }
                 Some(Gesture::Select { .. }) => {
                     if let Some(sel) = self.selection {
@@ -2204,7 +2346,7 @@ impl PaintApp {
                     );
                 }
                 Tool::Text => ui.ctx().set_cursor_icon(CursorIcon::Text),
-                Tool::Ellipse | Tool::Fill | Tool::Select | Tool::Rectangle | Tool::Grid => {
+                Tool::Shape | Tool::Fill | Tool::Select | Tool::Grid => {
                     painter.line_segment([pos - Vec2::X * 6.0, pos + Vec2::X * 6.0], outline);
                     painter.line_segment([pos - Vec2::Y * 6.0, pos + Vec2::Y * 6.0], outline);
                 }
@@ -2326,6 +2468,88 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool) -> egui::Response 
     ui.painter().rect_filled(rect, 4.0, bg);
     icons::paint(ui.painter(), rect.shrink(5.0), icon, fg);
     resp
+}
+
+/// The small arrow next to a tool button, opening a list of kinds (shapes,
+/// grid shapes). Returns the kind picked.
+fn kind_dropdown<K: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    hover: &str,
+    kinds: &[K],
+    current: K,
+    icon: fn(K) -> Icon,
+    label: fn(K) -> &'static str,
+) -> Option<K> {
+    let (rect, arrow) = ui.allocate_exact_size(Vec2::new(12.0, 28.0), Sense::click());
+    let arrow = arrow.on_hover_text(hover);
+    let color = if arrow.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    let c = rect.center();
+    ui.painter().add(Shape::convex_polygon(
+        vec![
+            c + Vec2::new(-4.0, -2.0),
+            c + Vec2::new(4.0, -2.0),
+            c + Vec2::new(0.0, 3.0),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    let mut picked = None;
+    egui::Popup::menu(&arrow).show(|ui| {
+        for &kind in kinds {
+            let (row, resp) = ui.allocate_exact_size(Vec2::new(140.0, 26.0), Sense::click());
+            let visuals = ui.visuals();
+            if kind == current || resp.hovered() {
+                let fill = if kind == current {
+                    visuals.selection.bg_fill
+                } else {
+                    visuals.widgets.hovered.weak_bg_fill
+                };
+                ui.painter().rect_filled(row, 4.0, fill);
+            }
+            let text_color = visuals.text_color();
+            let icon_rect = Rect::from_min_size(row.min + Vec2::new(4.0, 3.0), Vec2::splat(20.0));
+            icons::paint(ui.painter(), icon_rect, icon(kind), text_color);
+            ui.painter().text(
+                row.left_center() + Vec2::new(30.0, 0.0),
+                Align2::LEFT_CENTER,
+                label(kind),
+                egui::FontId::proportional(14.0),
+                text_color,
+            );
+            if resp.clicked() {
+                picked = Some(kind);
+                ui.close();
+            }
+        }
+    });
+    picked
+}
+
+fn shape_icon(kind: ShapeKind) -> Icon {
+    match kind {
+        ShapeKind::Rectangle => Icon::Rectangle,
+        ShapeKind::Ellipse => Icon::Ellipse,
+        ShapeKind::Triangle => Icon::Triangle,
+        ShapeKind::Line => Icon::Line,
+        ShapeKind::Polyline => Icon::Polyline,
+    }
+}
+
+/// Center of the pixel under `p`, so 1 px lines land on whole pixels.
+fn pixel_center(p: [f32; 2]) -> [f32; 2] {
+    [p[0].floor() + 0.5, p[1].floor() + 0.5]
+}
+
+/// Length and angle of a line, for the label next to the pointer.
+fn line_info(a: [f32; 2], b: [f32; 2]) -> String {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    // Angles count counter-clockwise from the right, as on paper.
+    let angle = (-dy).atan2(dx).to_degrees().rem_euclid(360.0);
+    format!("{:.0} px, {:.0}°", dx.hypot(dy), angle)
 }
 
 fn grid_icon(kind: GridKind) -> Icon {

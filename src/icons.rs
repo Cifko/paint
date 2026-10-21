@@ -9,6 +9,9 @@ pub enum Icon {
     Fill,
     Rectangle,
     Ellipse,
+    Triangle,
+    Line,
+    Polyline,
     Grid,
     TriangleGrid,
     HexagonGrid,
@@ -89,6 +92,20 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 })
                 .collect();
             painter.add(Shape::line(pts, thin));
+        }
+        Icon::Triangle => {
+            let pts = vec![p(0.5, 0.16), p(0.88, 0.82), p(0.12, 0.82)];
+            painter.add(Shape::closed_line(pts, thin));
+        }
+        Icon::Line => {
+            painter.line_segment([p(0.16, 0.84), p(0.84, 0.16)], thin);
+        }
+        Icon::Polyline => {
+            let pts = [p(0.12, 0.78), p(0.36, 0.3), p(0.62, 0.66), p(0.88, 0.2)];
+            painter.add(Shape::line(pts.to_vec(), thin));
+            for pt in pts {
+                painter.circle_filled(pt, s * 0.07, color);
+            }
         }
         Icon::Grid => {
             for i in 0..4 {
