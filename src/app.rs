@@ -1156,9 +1156,12 @@ impl PaintApp {
             Tool::Grid => self.grid_click(p),
             Tool::Text => {
                 // A click finishes any text being typed and starts new text there.
+                // The I-beam cursor points with its middle, so the first line is
+                // centered vertically on the click rather than hanging below it.
                 self.commit_text();
+                let half_line = self.text_style().caret_height() / 2.0;
                 self.text_edit = Some(TextEdit {
-                    origin: [p[0].round() as i32, p[1].round() as i32],
+                    origin: [p[0].round() as i32, (p[1] - half_line).round() as i32],
                     buffer: text::Buffer::default(),
                 });
             }
