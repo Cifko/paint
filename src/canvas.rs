@@ -772,7 +772,8 @@ fn find_region(layer: &Layer, x: i32, y: i32, matches: impl Fn(Rgba) -> bool) ->
 
 /// Flood fills the contiguous region around (`x`, `y`) on `layer`.
 ///
-/// If the region is enclosed, its pixels are painted. If it reaches past
+/// If the region is enclosed, its pixels are painted (or erased, with an
+/// erase `mode`). If it reaches past
 /// everything drawn (out to infinity), the layer's default color changes to
 /// the fill color instead, while enclosed areas keep their current look.
 pub fn flood_fill(
@@ -780,21 +781,23 @@ pub fn flood_fill(
     x: i32,
     y: i32,
     tolerance: u8,
-    color: Rgba,
-    opacity: f32,
+    mode: PaintMode,
 ) -> Option<FillResult> {
     let target = layer.pixel(x, y);
     let region = find_region(layer, x, y, |p| color_matches(p, target, tolerance));
 
-    let mut op = PaintOp::new(layer.id, PaintMode::Paint { color, opacity });
-    // Paint reached pixels in allocated tiles, growing the region by one
-    // pixel so it tucks under anti-aliased edges instead of leaving a seam.
+    let mut op = PaintOp::new(layer.id, mode);
+    // Paint reached pixels in allocated tiles. When painting, grow the region
+    // by one pixel so it tucks under anti-aliased edges instead of leaving a
+    // seam; when erasing that would eat into the neighboring outline instead.
+    let grow = matches!(mode, PaintMode::Paint { .. });
     let filled = |x: i32, y: i32| {
         region.contains(x, y)
-            || region.contains(x - 1, y)
-            || region.contains(x + 1, y)
-            || region.contains(x, y - 1)
-            || region.contains(x, y + 1)
+            || (grow
+                && (region.contains(x - 1, y)
+                    || region.contains(x + 1, y)
+                    || region.contains(x, y - 1)
+                    || region.contains(x, y + 1)))
     };
     let mut keys: Vec<TileKey> = region.existing.iter().copied().collect();
     keys.sort_unstable();
@@ -838,7 +841,10 @@ pub fn flood_fill(
                 }
             }
         }
-        let new = blend_over(layer.default, color, opacity);
+        let new = match mode {
+            PaintMode::Paint { color, opacity } => blend_over(layer.default, color, opacity),
+            PaintMode::Erase { strength } => erase(layer.default, strength),
+        };
         if new != layer.default {
             old_default = Some(layer.set_default(new));
         }
@@ -869,6 +875,13 @@ mod tests {
     use super::*;
 
     const RED: Rgba = [255, 0, 0, 255];
+
+    fn paint(color: Rgba) -> PaintMode {
+        PaintMode::Paint {
+            color,
+            opacity: 1.0,
+        }
+    }
 
     #[test]
     fn negative_coordinates_map_to_tiles() {
@@ -954,7 +967,7 @@ mod tests {
         };
         op.ellipse(&mut layer, circle, 3.0, false);
         let blue = [0, 0, 255, 255];
-        let r = flood_fill(&mut layer, 0, 0, 32, blue, 1.0).unwrap();
+        let r = flood_fill(&mut layer, 0, 0, 32, paint(blue)).unwrap();
         assert!(
             r.old_default.is_none(),
             "an enclosed fill must not change the default"
@@ -971,7 +984,7 @@ mod tests {
     #[test]
     fn flood_fill_empty_layer_changes_default() {
         let mut layer = Layer::new(1, "L");
-        let r = flood_fill(&mut layer, 0, 0, 0, RED, 1.0).unwrap();
+        let r = flood_fill(&mut layer, 0, 0, 0, paint(RED)).unwrap();
         assert_eq!(r.old_default, Some([0; 4]));
         assert!(
             layer.tiles.is_empty(),
@@ -1244,7 +1257,7 @@ mod tests {
                 y1: 40,
             },
         );
-        let r = flood_fill(&mut layer, 100, 0, 32, RED, 1.0).unwrap();
+        let r = flood_fill(&mut layer, 100, 0, 32, paint(RED)).unwrap();
         assert_eq!(r.old_default, Some([0; 4]));
         assert_eq!(layer.pixel(0, 0), [0; 4], "inside stays as it was");
         assert_eq!(layer.pixel(60, 0), RED, "outside next to the shape");
@@ -1265,7 +1278,7 @@ mod tests {
             },
         );
         assert!(!layer.tiles.contains_key(&(0, 0)));
-        flood_fill(&mut layer, 2000, 0, 32, RED, 1.0).unwrap();
+        flood_fill(&mut layer, 2000, 0, 32, paint(RED)).unwrap();
         assert_eq!(
             layer.pixel(10, 10),
             [0; 4],
@@ -1286,9 +1299,9 @@ mod tests {
                 y1: 40,
             },
         );
-        flood_fill(&mut layer, 100, 0, 32, RED, 1.0).unwrap();
+        flood_fill(&mut layer, 100, 0, 32, paint(RED)).unwrap();
         let blue = [0, 0, 255, 255];
-        let r = flood_fill(&mut layer, 0, 0, 32, blue, 1.0).unwrap();
+        let r = flood_fill(&mut layer, 0, 0, 32, paint(blue)).unwrap();
         assert!(r.old_default.is_none());
         assert_eq!(layer.pixel(0, 0), blue);
         assert_eq!(layer.pixel(100, 0), RED);
@@ -1297,7 +1310,7 @@ mod tests {
     #[test]
     fn erase_on_filled_background_allocates() {
         let mut layer = Layer::new(1, "L");
-        flood_fill(&mut layer, 0, 0, 0, RED, 1.0).unwrap();
+        flood_fill(&mut layer, 0, 0, 0, paint(RED)).unwrap();
         let mut op = PaintOp::new(1, PaintMode::Erase { strength: 1.0 });
         op.stroke_segment(&mut layer, [0.0, 0.0], [0.0, 0.0], 3.0);
         assert_eq!(layer.pixel(0, 0), [0; 4]);
@@ -1325,7 +1338,7 @@ mod tests {
                 .unwrap()
         };
         let before = bounds(&layer);
-        flood_fill(&mut layer, 100, 0, 32, RED, 1.0).unwrap();
+        flood_fill(&mut layer, 100, 0, 32, paint(RED)).unwrap();
         // The fill may cover the faintest anti-aliased edge pixels, but the
         // background around the circle must not count as content.
         let after = bounds(&layer);
@@ -1338,5 +1351,33 @@ mod tests {
             after.width() >= before.width() - 2,
             "{after:?} vs {before:?}"
         );
+    }
+
+    #[test]
+    fn clear_fill_erases_region_and_background() {
+        let mut layer = Layer::new(1, "L");
+        ring(
+            &mut layer,
+            IRect {
+                x0: -40,
+                y0: -40,
+                x1: 40,
+                y1: 40,
+            },
+        );
+        flood_fill(&mut layer, 0, 0, 32, paint(RED)).unwrap();
+        flood_fill(&mut layer, 100, 0, 32, paint(RED)).unwrap();
+        let clear = PaintMode::Erase { strength: 1.0 };
+        // Clearing the inside erases just the enclosed red.
+        let r = flood_fill(&mut layer, 0, 0, 32, clear).unwrap();
+        assert!(r.old_default.is_none());
+        assert_eq!(layer.pixel(0, 0), [0; 4]);
+        assert_eq!(layer.pixel(100, 0), RED);
+        // Clearing the outside makes the infinite background clear again.
+        let r = flood_fill(&mut layer, 100, 0, 32, clear).unwrap();
+        assert_eq!(r.old_default, Some(RED));
+        assert_eq!(layer.pixel(100, 0), [0; 4]);
+        assert_eq!(layer.pixel(9_000, 9_000), [0; 4]);
+        assert_eq!(layer.pixel(40, 0)[3], 255, "the outline stays");
     }
 }
