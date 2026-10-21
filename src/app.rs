@@ -8,6 +8,7 @@ use eframe::egui::{
 
 use crate::canvas::{self, IRect, Image, Layer, LayerId, PaintMode, PaintOp, TILE, TileKey};
 use crate::history::{Action, History};
+use crate::icons::{self, Icon};
 use crate::settings::Settings;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -15,18 +16,31 @@ enum Tool {
     Brush,
     Eraser,
     Fill,
+    Rectangle,
     Circle,
+    Grid,
     Select,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, Key); 5] = [
-        (Tool::Brush, "Brush", Key::B),
-        (Tool::Eraser, "Eraser", Key::E),
-        (Tool::Fill, "Fill", Key::G),
-        (Tool::Circle, "Circle", Key::C),
-        (Tool::Select, "Select", Key::M),
+    const ALL: [(Tool, &'static str, Key, Icon); 7] = [
+        (Tool::Brush, "Brush", Key::B, Icon::Brush),
+        (Tool::Eraser, "Eraser", Key::E, Icon::Eraser),
+        (Tool::Fill, "Fill", Key::G, Icon::Fill),
+        (Tool::Rectangle, "Rectangle", Key::R, Icon::Rectangle),
+        (Tool::Circle, "Circle", Key::C, Icon::Circle),
+        (Tool::Grid, "Grid", Key::T, Icon::Grid),
+        (Tool::Select, "Select", Key::M, Icon::Select),
     ];
+}
+
+/// Progress of the click-by-click grid tool.
+#[derive(Clone, Copy, Debug)]
+enum GridState {
+    /// First click done; the pointer sizes the cell.
+    Cell { origin: [i32; 2] },
+    /// Cell fixed; the pointer sizes the whole grid.
+    Grid { origin: [i32; 2], cell: [i32; 2] },
 }
 
 /// An in-progress interaction with the canvas.
@@ -37,6 +51,9 @@ enum Gesture {
     },
     Circle {
         center: [f32; 2],
+    },
+    Rectangle {
+        start: [i32; 2],
     },
     Select {
         start: [i32; 2],
@@ -58,14 +75,44 @@ enum Gesture {
 
 /// A pasted image that hasn't been placed onto a layer yet.
 struct Floating {
+    /// The image as pasted.
+    original: Image,
+    /// What will be placed: `original`, possibly with white made transparent.
     image: Image,
+    white_transparent: bool,
     x: i32,
     y: i32,
-    /// GPU textures for the image, split so no texture exceeds GPU limits.
+    /// GPU textures for `image`, split so no texture exceeds GPU limits.
     chunks: Vec<(IRect, TextureHandle)>,
 }
 
 impl Floating {
+    fn new(original: Image, x: i32, y: i32, white_transparent: bool) -> Self {
+        let mut f = Self {
+            image: original.clone(),
+            original,
+            white_transparent: false,
+            x,
+            y,
+            chunks: Vec::new(),
+        };
+        f.set_white_transparent(white_transparent);
+        f
+    }
+
+    fn set_white_transparent(&mut self, on: bool) {
+        if on == self.white_transparent {
+            return;
+        }
+        self.white_transparent = on;
+        self.image = if on {
+            canvas::white_to_transparent(&self.original)
+        } else {
+            self.original.clone()
+        };
+        self.chunks.clear();
+    }
+
     fn rect(&self) -> IRect {
         IRect {
             x0: self.x,
@@ -124,12 +171,18 @@ pub struct PaintApp {
 
     selection: Option<IRect>,
     floating: Option<Floating>,
+    grid: Option<GridState>,
     /// Last copied image, used if the system clipboard can't be read.
     clipboard: Option<Image>,
 
     /// Canvas coordinate shown at the top-left corner of the canvas area.
     offset: Vec2,
+    /// Canvas pixels per physical screen pixel (1.0 = 100%, pixel for pixel).
     zoom: f32,
+    /// Physical pixels per egui point (the OS display scaling).
+    pixels_per_point: f32,
+    /// Modifier keys held during the current frame.
+    modifiers: Modifiers,
     /// Screen area of the canvas during the last frame.
     canvas_rect: Rect,
     /// Pointer position if it was over the canvas during the last frame.
@@ -166,9 +219,12 @@ impl PaintApp {
             settings_open: false,
             selection: None,
             floating: None,
+            grid: None,
             clipboard: None,
             offset: Vec2::ZERO,
             zoom: 1.0,
+            pixels_per_point: cc.egui_ctx.pixels_per_point(),
+            modifiers: Modifiers::NONE,
             canvas_rect: Rect::NOTHING,
             canvas_hover: None,
             gesture: None,
@@ -184,6 +240,10 @@ impl PaintApp {
 impl eframe::App for PaintApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.pixels_per_point = ctx.pixels_per_point();
+        if self.tool != Tool::Grid {
+            self.grid = None;
+        }
         self.shortcuts(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
@@ -250,7 +310,7 @@ impl PaintApp {
         } else if do_undo {
             self.undo();
         }
-        for (tool, _, key) in Tool::ALL {
+        for (tool, _, key, _) in Tool::ALL {
             if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key)) {
                 self.tool = tool;
             }
@@ -266,8 +326,8 @@ impl PaintApp {
         if enter {
             self.place_floating();
         }
-        // Esc / Delete drop a pending paste first, otherwise act on the selection.
-        if escape && self.floating.take().is_none() {
+        // Esc cancels an unfinished grid or paste first, otherwise clears the selection.
+        if escape && self.grid.take().is_none() && self.floating.take().is_none() {
             self.selection = None;
         }
         if delete && self.floating.take().is_none() {
@@ -295,9 +355,13 @@ impl PaintApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (tool, name, key) in Tool::ALL {
-                ui.selectable_value(&mut self.tool, tool, name)
-                    .on_hover_text(format!("{name} ({})", key.name()));
+            for (tool, name, key, icon) in Tool::ALL {
+                if icon_button(ui, icon, self.tool == tool)
+                    .on_hover_text(format!("{name} ({})", key.name()))
+                    .clicked()
+                {
+                    self.tool = tool;
+                }
             }
             ui.separator();
 
@@ -363,7 +427,11 @@ impl PaintApp {
             ui.separator();
 
             ui.label(format!("{:.0}%", self.zoom * 100.0));
-            if ui.button("Reset view").clicked() {
+            if ui
+                .button("Reset view")
+                .on_hover_text("Back to the origin at 100% (1 image pixel = 1 screen pixel)")
+                .clicked()
+            {
                 self.offset = Vec2::ZERO;
                 self.zoom = 1.0;
             }
@@ -406,14 +474,24 @@ impl PaintApp {
                         ui.label("Tolerance");
                         ui.add(egui::DragValue::new(&mut self.fill_tolerance).range(0..=255));
                     }
-                    Tool::Circle => {
+                    Tool::Circle | Tool::Rectangle => {
                         ui.separator();
                         ui.checkbox(&mut self.fill_shapes, "Filled");
+                    }
+                    Tool::Grid => {
+                        ui.separator();
+                        ui.small(match self.grid {
+                            None => "Click to start the first cell",
+                            Some(GridState::Cell { .. }) => "Click to set the cell size",
+                            Some(GridState::Grid { .. }) => "Click to set the grid size",
+                        });
                     }
                     _ => {}
                 }
                 if self.floating.is_some() {
                     ui.separator();
+                    ui.checkbox(&mut self.settings.paste_white_transparent, "White → clear")
+                        .on_hover_text("Treat white pixels of the pasted image as transparent");
                     ui.vertical_centered_justified(|ui| {
                         if ui.button("Place").on_hover_text("Enter").clicked() {
                             self.place_floating();
@@ -579,12 +657,8 @@ impl PaintApp {
         let center = self.to_canvas(rect, self.canvas_hover.unwrap_or(rect.center()));
         let x = (center[0] - image.width as f32 / 2.0).round() as i32;
         let y = (center[1] - image.height as f32 / 2.0).round() as i32;
-        self.floating = Some(Floating {
-            image,
-            x,
-            y,
-            chunks: Vec::new(),
-        });
+        let white = self.settings.paste_white_transparent;
+        self.floating = Some(Floating::new(image, x, y, white));
         self.selection = None;
     }
 
@@ -607,20 +681,45 @@ impl PaintApp {
 
     // ----- Canvas -----
 
+    /// Screen points per canvas pixel. egui works in points, which are larger
+    /// than physical pixels when the OS display scaling is above 100%.
+    fn scale(&self) -> f32 {
+        self.zoom / self.pixels_per_point
+    }
+
     fn to_canvas(&self, rect: Rect, p: Pos2) -> [f32; 2] {
-        let v = (p - rect.min) / self.zoom + self.offset;
+        let v = (p - rect.min) / self.scale() + self.offset;
         [v.x, v.y]
     }
 
     fn to_screen(&self, rect: Rect, p: [f32; 2]) -> Pos2 {
-        rect.min + (Vec2::new(p[0], p[1]) - self.offset) * self.zoom
+        rect.min + (Vec2::new(p[0], p[1]) - self.offset) * self.scale()
     }
 
+    /// Screen rectangle of a canvas rectangle, snapped to physical pixels so
+    /// images stay sharp at 100% and neighboring tiles meet exactly.
     fn screen_rect_of(&self, rect: Rect, r: IRect) -> Rect {
+        let ppp = self.pixels_per_point;
+        let snap = |p: Pos2| Pos2::new((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp);
         Rect::from_min_max(
-            self.to_screen(rect, [r.x0 as f32, r.y0 as f32]),
-            self.to_screen(rect, [r.x1 as f32, r.y1 as f32]),
+            snap(self.to_screen(rect, [r.x0 as f32, r.y0 as f32])),
+            snap(self.to_screen(rect, [r.x1 as f32, r.y1 as f32])),
         )
+    }
+
+    fn square_held(&self) -> bool {
+        self.settings.square_modifier.is_held(self.modifiers)
+    }
+
+    /// Pixel corner under `p`, moved to make a square with `start` if the
+    /// snap-to-square key is held.
+    fn rect_end(&self, start: [i32; 2], p: [f32; 2]) -> [i32; 2] {
+        let end = [p[0].round() as i32, p[1].round() as i32];
+        if self.square_held() {
+            canvas::square_end(start, end)
+        } else {
+            end
+        }
     }
 
     fn visible_canvas_rect(&self, rect: Rect) -> IRect {
@@ -678,7 +777,9 @@ impl PaintApp {
         // Walk the raw events rather than the end-of-frame pointer state so
         // every motion sample lands in the stroke and quick press/release
         // pairs within one frame aren't lost.
-        let (events, space) = ui.input(|i| (i.events.clone(), i.key_down(Key::Space)));
+        let (events, space, modifiers) =
+            ui.input(|i| (i.events.clone(), i.key_down(Key::Space), i.modifiers));
+        self.modifiers = modifiers;
         let ctx = ui.ctx();
         for event in events {
             match event {
@@ -694,6 +795,9 @@ impl PaintApp {
                     if self.gesture.is_some() || !on_canvas {
                         continue;
                     }
+                    // Clicking the canvas takes keyboard focus away from text
+                    // fields so shortcuts like Ctrl+V reach the canvas again.
+                    ctx.memory_mut(|m| m.stop_text_input());
                     let resize = self.settings.resize_with_drag
                         && self.settings.resize_modifier.is_held(modifiers);
                     let gesture = match button {
@@ -705,6 +809,10 @@ impl PaintApp {
                         PointerButton::Primary if space => Some(Gesture::Pan { button, last: pos }),
                         PointerButton::Primary => {
                             self.begin_tool(rect, pos);
+                            None
+                        }
+                        PointerButton::Secondary => {
+                            self.grid = None;
                             None
                         }
                         _ => None,
@@ -736,9 +844,14 @@ impl PaintApp {
 
     fn pointer_moved(&mut self, rect: Rect, pos: Pos2) {
         let p = self.to_canvas(rect, pos);
+        let scale = self.scale();
+        let select_end = match &self.gesture {
+            Some(Gesture::Select { start }) => Some(self.rect_end(*start, p)),
+            _ => None,
+        };
         match &mut self.gesture {
             Some(Gesture::Pan { last, .. }) => {
-                self.offset -= (pos - *last) / self.zoom;
+                self.offset -= (pos - *last) / scale;
                 *last = pos;
             }
             Some(Gesture::Stroke { op, last }) if p != *last => {
@@ -748,13 +861,8 @@ impl PaintApp {
                 *last = p;
             }
             Some(Gesture::Select { start }) => {
-                let end = [p[0].round() as i32, p[1].round() as i32];
-                self.selection = Some(IRect {
-                    x0: start[0].min(end[0]),
-                    y0: start[1].min(end[1]),
-                    x1: start[0].max(end[0]),
-                    y1: start[1].max(end[1]),
-                });
+                let end = select_end.unwrap_or(*start);
+                self.selection = Some(canvas::rect_from_corners(*start, end));
             }
             Some(Gesture::MoveFloating { grab }) => {
                 if let Some(f) = &mut self.floating {
@@ -813,6 +921,11 @@ impl PaintApp {
                 self.gesture = Some(Gesture::Stroke { op, last: p });
             }
             Tool::Circle => self.gesture = Some(Gesture::Circle { center: p }),
+            Tool::Rectangle => {
+                let start = [p[0].round() as i32, p[1].round() as i32];
+                self.gesture = Some(Gesture::Rectangle { start });
+            }
+            Tool::Grid => self.grid_click(p),
             Tool::Fill => {
                 let mut limit = self.visible_canvas_rect(rect);
                 let layer = &mut self.layers[self.active];
@@ -832,6 +945,42 @@ impl PaintApp {
             }
             Tool::Select => unreachable!(),
         }
+    }
+
+    /// Advances the grid tool: start the cell, fix the cell, then draw the grid.
+    fn grid_click(&mut self, p: [f32; 2]) {
+        self.grid = match self.grid {
+            None => Some(GridState::Cell {
+                origin: [p[0].round() as i32, p[1].round() as i32],
+            }),
+            Some(GridState::Cell { origin }) => {
+                let end = self.rect_end(origin, p);
+                let cell = [(end[0] - origin[0]).abs(), (end[1] - origin[1]).abs()];
+                if cell[0] > 0 && cell[1] > 0 {
+                    Some(GridState::Grid { origin, cell })
+                } else {
+                    self.grid
+                }
+            }
+            Some(GridState::Grid { origin, cell }) => {
+                let end = self.rect_end(origin, p);
+                let (top_left, cols, rows) = canvas::grid_layout(origin, cell, end);
+                if cols == 0 || rows == 0 {
+                    return;
+                }
+                let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
+                op.grid(
+                    &mut self.layers[self.active],
+                    top_left,
+                    cell,
+                    cols,
+                    rows,
+                    self.size,
+                );
+                self.commit(op);
+                None
+            }
+        };
     }
 
     fn finish_gesture(&mut self) {
@@ -856,6 +1005,22 @@ impl PaintApp {
                     &mut self.layers[self.active],
                     center,
                     radius,
+                    self.size,
+                    self.fill_shapes,
+                );
+                self.commit(op);
+            }
+            Some(Gesture::Rectangle { start }) => {
+                let Some(pos) = pos else { return };
+                let end = self.rect_end(start, self.to_canvas(rect, pos));
+                let r = canvas::rect_from_corners(start, end);
+                if r.width() <= 0 || r.height() <= 0 {
+                    return;
+                }
+                let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
+                op.rectangle(
+                    &mut self.layers[self.active],
+                    r,
                     self.size,
                     self.fill_shapes,
                 );
@@ -941,10 +1106,11 @@ impl PaintApp {
             ctx.request_repaint();
         }
 
-        if let Some(f) = &mut self.floating
-            && f.chunks.is_empty()
-        {
-            f.chunks = image_chunks(ctx, &f.image);
+        if let Some(f) = &mut self.floating {
+            f.set_white_transparent(self.settings.paste_white_transparent);
+            if f.chunks.is_empty() {
+                f.chunks = image_chunks(ctx, &f.image);
+            }
         }
     }
 
@@ -1027,23 +1193,80 @@ impl PaintApp {
         }
 
         let outline = Stroke::new(1.0, Color32::from_gray(120));
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        let color = self.color.gamma_multiply(self.opacity);
+        let pen = Stroke::new(self.size * self.scale(), color);
         // Circle preview.
         if let Some(Gesture::Circle { center }) = &self.gesture
-            && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
+            && let Some(pos) = pointer
         {
             let c = self.to_screen(rect, *center);
             let r = c.distance(pos);
-            let color = self.color.gamma_multiply(self.opacity);
             if self.fill_shapes {
                 painter.circle_filled(c, r, color);
             } else {
-                painter.circle_stroke(c, r, Stroke::new(self.size * self.zoom, color));
+                painter.circle_stroke(c, r, pen);
+            }
+        }
+
+        // Rectangle preview, and the size of whatever rectangle is being dragged.
+        if let Some(pos) = pointer {
+            let p = self.to_canvas(rect, pos);
+            match &self.gesture {
+                Some(Gesture::Rectangle { start }) => {
+                    let r = canvas::rect_from_corners(*start, self.rect_end(*start, p));
+                    let sr = self.screen_rect_of(rect, r);
+                    if self.fill_shapes {
+                        painter.rect_filled(sr, 0.0, color);
+                    } else {
+                        painter.rect_stroke(sr, 0.0, pen, egui::StrokeKind::Middle);
+                    }
+                    info_label(&painter, pos, format!("{} × {}", r.width(), r.height()));
+                }
+                Some(Gesture::Select { .. }) => {
+                    if let Some(sel) = self.selection {
+                        info_label(&painter, pos, format!("{} × {}", sel.width(), sel.height()));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Grid preview.
+        if let (Some(grid), Some(pos)) = (self.grid, pointer) {
+            let p = self.to_canvas(rect, pos);
+            match grid {
+                GridState::Cell { origin } => {
+                    let r = canvas::rect_from_corners(origin, self.rect_end(origin, p));
+                    painter.rect_stroke(
+                        self.screen_rect_of(rect, r),
+                        0.0,
+                        pen,
+                        egui::StrokeKind::Middle,
+                    );
+                    info_label(
+                        &painter,
+                        pos,
+                        format!("cell {} × {}", r.width(), r.height()),
+                    );
+                }
+                GridState::Grid { origin, cell } => {
+                    let end = self.rect_end(origin, p);
+                    let (top_left, cols, rows) = canvas::grid_layout(origin, cell, end);
+                    // The area being dragged out, and the cells that fit in it.
+                    marching_ants(
+                        &painter,
+                        self.screen_rect_of(rect, canvas::rect_from_corners(origin, end)),
+                    );
+                    self.paint_grid_preview(&painter, rect, top_left, cell, cols, rows, pen);
+                    info_label(&painter, pos, format!("{cols} × {rows} cells"));
+                }
             }
         }
 
         // While resizing, show the brush at the spot where the drag started.
         if let Some(Gesture::Resize { anchor, .. }) = &self.gesture {
-            let r = (self.size / 2.0 * self.zoom).max(1.0);
+            let r = (self.size / 2.0 * self.scale()).max(1.0);
             painter.circle_stroke(*anchor, r, Stroke::new(2.0, Color32::WHITE));
             painter.circle_stroke(*anchor, r, Stroke::new(1.0, Color32::BLACK));
             painter.text(
@@ -1070,15 +1293,89 @@ impl PaintApp {
             }
             match self.tool {
                 Tool::Brush | Tool::Eraser => {
-                    painter.circle_stroke(pos, (self.size / 2.0 * self.zoom).max(1.0), outline);
+                    painter.circle_stroke(pos, (self.size / 2.0 * self.scale()).max(1.0), outline);
                 }
-                Tool::Circle | Tool::Fill | Tool::Select => {
+                Tool::Circle | Tool::Fill | Tool::Select | Tool::Rectangle | Tool::Grid => {
                     painter.line_segment([pos - Vec2::X * 6.0, pos + Vec2::X * 6.0], outline);
                     painter.line_segment([pos - Vec2::Y * 6.0, pos + Vec2::Y * 6.0], outline);
                 }
             }
         }
     }
+}
+
+impl PaintApp {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_grid_preview(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        top_left: [i32; 2],
+        cell: [i32; 2],
+        cols: i32,
+        rows: i32,
+        pen: Stroke,
+    ) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let at = |c: i32, r: i32| {
+            self.to_screen(
+                rect,
+                [
+                    (top_left[0] + c * cell[0]) as f32,
+                    (top_left[1] + r * cell[1]) as f32,
+                ],
+            )
+        };
+        // Huge grids would just be a solid blob on screen; cap the line count.
+        if cols > 500 || rows > 500 {
+            painter.rect_stroke(
+                Rect::from_two_pos(at(0, 0), at(cols, rows)),
+                0.0,
+                pen,
+                egui::StrokeKind::Middle,
+            );
+            return;
+        }
+        for c in 0..=cols {
+            painter.line_segment([at(c, 0), at(c, rows)], pen);
+        }
+        for r in 0..=rows {
+            painter.line_segment([at(0, r), at(cols, r)], pen);
+        }
+    }
+}
+
+/// Draws a small text label with a background next to the pointer.
+fn info_label(painter: &egui::Painter, pointer: Pos2, text: String) {
+    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
+    let pos = pointer + Vec2::new(16.0, 16.0);
+    let bg = Rect::from_min_size(pos, galley.size()).expand(4.0);
+    painter.rect_filled(bg, 4.0, Color32::from_black_alpha(190));
+    painter.galley(pos, galley, Color32::WHITE);
+}
+
+/// A square toolbar button showing an icon.
+fn icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    let visuals = ui.visuals();
+    let (bg, fg) = if selected {
+        (visuals.selection.bg_fill, visuals.selection.stroke.color)
+    } else if resp.hovered() {
+        (
+            visuals.widgets.hovered.weak_bg_fill,
+            visuals.widgets.hovered.fg_stroke.color,
+        )
+    } else {
+        (
+            Color32::TRANSPARENT,
+            visuals.widgets.inactive.fg_stroke.color,
+        )
+    };
+    ui.painter().rect_filled(rect, 4.0, bg);
+    icons::paint(ui.painter(), rect.shrink(5.0), icon, fg);
+    resp
 }
 
 /// Draws a selection outline visible on both light and dark content.

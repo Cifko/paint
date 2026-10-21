@@ -253,6 +253,59 @@ impl PaintOp {
         }
     }
 
+    /// Draws a pixel-aligned rectangle, either filled or outlined with a line
+    /// of `width` centered on its edges.
+    pub fn rectangle(&mut self, layer: &mut Layer, r: IRect, width: f32, filled: bool) {
+        let half = (width / 2.0).max(0.5);
+        let grow = if filled { 0.0 } else { half };
+        let area = bbox(
+            r.x0 as f32 - grow,
+            r.y0 as f32 - grow,
+            r.x1 as f32 + grow,
+            r.y1 as f32 + grow,
+        );
+        let (cx, cy) = ((r.x0 + r.x1) as f32 / 2.0, (r.y0 + r.y1) as f32 / 2.0);
+        let (hw, hh) = (r.width() as f32 / 2.0, r.height() as f32 / 2.0);
+        self.apply(layer, area, |x, y| {
+            // Chebyshev distance to the rectangle's edge keeps corners square.
+            let d = ((x - cx).abs() - hw).max((y - cy).abs() - hh);
+            if filled {
+                coverage(-d)
+            } else {
+                coverage(half - d.abs())
+            }
+        });
+    }
+
+    /// Draws the lines of a `cols`×`rows` grid of `cell`-sized cells whose
+    /// top-left corner is `origin`.
+    pub fn grid(
+        &mut self,
+        layer: &mut Layer,
+        origin: [i32; 2],
+        cell: [i32; 2],
+        cols: i32,
+        rows: i32,
+        width: f32,
+    ) {
+        if cols <= 0 || rows <= 0 || cell[0] <= 0 || cell[1] <= 0 {
+            return;
+        }
+        let half = (width / 2.0).max(0.5);
+        let (x0, y0) = (origin[0] as f32, origin[1] as f32);
+        let (cw, ch) = (cell[0] as f32, cell[1] as f32);
+        let (x1, y1) = (x0 + cols as f32 * cw, y0 + rows as f32 * ch);
+        let area = bbox(x0 - half, y0 - half, x1 + half, y1 + half);
+        self.apply(layer, area, |x, y| {
+            // Distance to the nearest vertical line, limited to the grid's height.
+            let k = ((x - x0) / cw).round().clamp(0.0, cols as f32);
+            let dv = (x - (x0 + k * cw)).abs().max((y0 - y).max(y - y1).max(0.0));
+            let k = ((y - y0) / ch).round().clamp(0.0, rows as f32);
+            let dh = (y - (y0 + k * ch)).abs().max((x0 - x).max(x - x1).max(0.0));
+            coverage(half - dv.min(dh))
+        });
+    }
+
     /// Composites `image` onto the layer with its top-left corner at (`x`, `y`).
     pub fn blit(&mut self, layer: &mut Layer, image: &Image, x: i32, y: i32) {
         let area = IRect {
@@ -346,6 +399,58 @@ pub struct Image {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<Rgba>,
+}
+
+/// Returns a copy of `image` with pure white pixels made transparent.
+pub fn white_to_transparent(image: &Image) -> Image {
+    let pixels = image
+        .pixels
+        .iter()
+        .map(|&p| if p[..3] == [255, 255, 255] { [0; 4] } else { p })
+        .collect();
+    Image {
+        width: image.width,
+        height: image.height,
+        pixels,
+    }
+}
+
+/// Moves `end` so the rectangle from `start` to it becomes a square
+/// (the larger side wins), keeping the drag direction.
+pub fn square_end(start: [i32; 2], end: [i32; 2]) -> [i32; 2] {
+    let (dx, dy) = (end[0] - start[0], end[1] - start[1]);
+    let d = dx.abs().max(dy.abs());
+    let sign = |v: i32| if v < 0 { -1 } else { 1 };
+    [start[0] + sign(dx) * d, start[1] + sign(dy) * d]
+}
+
+/// Normalized rectangle spanned by two corners.
+pub fn rect_from_corners(a: [i32; 2], b: [i32; 2]) -> IRect {
+    IRect {
+        x0: a[0].min(b[0]),
+        y0: a[1].min(b[1]),
+        x1: a[0].max(b[0]),
+        y1: a[1].max(b[1]),
+    }
+}
+
+/// Lays out a grid of `cell`-sized cells from `origin` towards `end`, fitting
+/// as many whole cells as possible (rounded down). Returns the top-left
+/// corner of the grid and its column and row counts.
+pub fn grid_layout(origin: [i32; 2], cell: [i32; 2], end: [i32; 2]) -> ([i32; 2], i32, i32) {
+    let cols = (end[0] - origin[0]).abs() / cell[0].max(1);
+    let rows = (end[1] - origin[1]).abs() / cell[1].max(1);
+    let x0 = if end[0] < origin[0] {
+        origin[0] - cols * cell[0]
+    } else {
+        origin[0]
+    };
+    let y0 = if end[1] < origin[1] {
+        origin[1] - rows * cell[1]
+    } else {
+        origin[1]
+    };
+    ([x0, y0], cols, rows)
 }
 
 /// Copies the pixels of `layer` inside `area`.
@@ -737,5 +842,84 @@ mod tests {
         );
         let thumb = thumbnail(&layer, b, 16);
         assert!(thumb.iter().any(|p| p[0] == 255 && p[3] > 0));
+    }
+
+    #[test]
+    fn grid_layout_rounds_down() {
+        // 3x7 cells in a 10x20 area -> 3 columns, 2 rows.
+        assert_eq!(grid_layout([0, 0], [3, 7], [10, 20]), ([0, 0], 3, 2));
+        // Dragging up/left grows the grid the other way.
+        assert_eq!(grid_layout([0, 0], [3, 7], [-10, -20]), ([-9, -14], 3, 2));
+        assert_eq!(grid_layout([5, 5], [3, 7], [6, 30]), ([5, 5], 0, 3));
+    }
+
+    #[test]
+    fn square_snapping() {
+        assert_eq!(square_end([0, 0], [10, 4]), [10, 10]);
+        assert_eq!(square_end([0, 0], [-3, 8]), [-8, 8]);
+        assert_eq!(square_end([5, 5], [5, 5]), [5, 5]);
+    }
+
+    #[test]
+    fn rectangle_outline_and_fill() {
+        let mut layer = Layer::new(1, "L");
+        let r = IRect {
+            x0: 0,
+            y0: 0,
+            x1: 20,
+            y1: 10,
+        };
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: RED,
+                opacity: 1.0,
+            },
+        );
+        op.rectangle(&mut layer, r, 2.0, false);
+        assert_eq!(layer.pixel(10, 0), RED);
+        assert_eq!(layer.pixel(19, 5), RED);
+        assert_eq!(layer.pixel(10, 5), [0; 4], "outline must stay hollow");
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: RED,
+                opacity: 1.0,
+            },
+        );
+        op.rectangle(&mut layer, r, 2.0, true);
+        assert_eq!(layer.pixel(10, 5), RED);
+        assert_eq!(layer.pixel(21, 5), [0; 4], "nothing beyond the outline");
+    }
+
+    #[test]
+    fn grid_draws_lines_not_cells() {
+        let mut layer = Layer::new(1, "L");
+        let mut op = PaintOp::new(
+            1,
+            PaintMode::Paint {
+                color: RED,
+                opacity: 1.0,
+            },
+        );
+        op.grid(&mut layer, [0, 0], [10, 10], 3, 2, 2.0);
+        for x in [0, 10, 20, 29] {
+            assert_eq!(layer.pixel(x, 5), RED, "vertical line near x={x}");
+        }
+        assert_eq!(layer.pixel(15, 10), RED, "middle horizontal line");
+        assert_eq!(layer.pixel(5, 5), [0; 4], "cell interior");
+        assert_eq!(layer.pixel(35, 5), [0; 4], "beyond last column");
+        assert_eq!(layer.pixel(5, 25), [0; 4], "beyond last row");
+    }
+
+    #[test]
+    fn white_becomes_transparent() {
+        let img = Image {
+            width: 2,
+            height: 1,
+            pixels: vec![[255, 255, 255, 255], [250, 255, 255, 255]],
+        };
+        let out = white_to_transparent(&img);
+        assert_eq!(out.pixels, vec![[0; 4], [250, 255, 255, 255]]);
     }
 }

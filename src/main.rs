@@ -3,6 +3,7 @@
 mod app;
 mod canvas;
 mod history;
+mod icons;
 mod settings;
 
 fn main() -> eframe::Result {

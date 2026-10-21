@@ -6,10 +6,13 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 
 ## Features
 
-- **Infinite canvas** – paint anywhere; pan and zoom freely.
-- **Tools** – Brush, Eraser, Flood fill, Circle (outline or filled), rectangle Select.
+- **Infinite canvas** – paint anywhere; pan and zoom freely. 100% zoom is pixel-for-pixel
+  with the screen, also on displays with OS scaling (e.g. 150% on Windows).
+- **Tools** – Brush, Eraser, Flood fill, Rectangle and Circle (outline or filled),
+  Grid, rectangle Select.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
+  White is treated as transparent when pasting (toggleable).
 - **Color picker** in the top bar plus a quick palette.
 - **Floating size and opacity sliders** on the left side of the canvas.
 - **Quick brush resize** – hold Alt (Option on macOS) and drag left/right or scroll;
@@ -24,7 +27,9 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | Paint / use tool | Left mouse button |
 | Pan | Middle mouse drag, or Space + left drag |
 | Zoom | Mouse wheel / pinch (around the cursor) |
-| Brush / Eraser / Fill / Circle / Select | `B` / `E` / `G` / `C` / `M` |
+| Brush / Eraser / Fill | `B` / `E` / `G` |
+| Rectangle / Circle / Grid / Select | `R` / `C` / `T` / `M` |
+| Snap rectangle, cell, grid or selection to a square | Hold `Shift` while drawing (configurable) |
 | Change brush size | Hold `Alt` (`Option` on macOS) + drag left/right or scroll (configurable) |
 | Copy selection (active layer) | `Ctrl+C` |
 | Copy selection (all visible layers) | `Ctrl+Shift+C` |
@@ -34,7 +39,13 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | Undo | `Ctrl+Z` (`Cmd+Z` on macOS) |
 | Redo | `Ctrl+Shift+Z` or `Ctrl+Y` |
 
-Circle: press at the center and drag out the radius. The pen size is the outline width.
+Circle: press at the center and drag out the radius. Rectangle: drag from corner to
+corner. For both, the pen size is the outline width.
+
+Grid: click where the grid starts, move the mouse to size one cell, click, then move
+to size the whole grid and click again. As many whole cells as fit are drawn (e.g. a
+3×7 cell in a 10×20 area gives 3×2 cells); the count is shown while you move.
+`Esc` or right-click cancels.
 
 Pasted images float above the active layer until placed; drag them to move.
 
