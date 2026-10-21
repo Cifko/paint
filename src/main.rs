@@ -14,7 +14,12 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Paint")
-            .with_inner_size([1280.0, 800.0]),
+            .with_app_id("paint")
+            .with_inner_size([1280.0, 800.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                    .expect("bundled icon is a valid PNG"),
+            ),
         ..Default::default()
     };
     eframe::run_native(
