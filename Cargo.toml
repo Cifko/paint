@@ -10,6 +10,8 @@ ab_glyph = "0.2"
 arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 dejavu = "2.37"
 eframe = { version = "0.37", features = ["persistence"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 
 # Keep debug builds responsive enough to paint with.

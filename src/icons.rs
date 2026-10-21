@@ -10,6 +10,8 @@ pub enum Icon {
     Rectangle,
     Ellipse,
     Grid,
+    TriangleGrid,
+    HexagonGrid,
     Select,
     Text,
 }
@@ -94,6 +96,28 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.line_segment([p(t, 0.14), p(t, 0.86)], thin);
                 painter.line_segment([p(0.14, t), p(0.86, t)], thin);
             }
+        }
+        Icon::TriangleGrid => {
+            let tri = [
+                [p(0.06, 0.8), p(0.28, 0.24), p(0.5, 0.8)],
+                [p(0.28, 0.24), p(0.72, 0.24), p(0.5, 0.8)],
+                [p(0.5, 0.8), p(0.72, 0.24), p(0.94, 0.8)],
+            ];
+            for t in tri {
+                painter.add(Shape::closed_line(t.to_vec(), thin));
+            }
+        }
+        Icon::HexagonGrid => {
+            let hex = |cx: f32, cy: f32, r: f32| -> Vec<Pos2> {
+                (0..6)
+                    .map(|i| {
+                        let a = i as f32 * std::f32::consts::FRAC_PI_3;
+                        p(cx + r * a.cos(), cy + r * 0.87 * a.sin())
+                    })
+                    .collect()
+            };
+            painter.add(Shape::closed_line(hex(0.3, 0.36, 0.24), thin));
+            painter.add(Shape::closed_line(hex(0.66, 0.57, 0.24), thin));
         }
         Icon::Text => {
             let bold = Stroke::new((s * 0.14).max(1.5), color);

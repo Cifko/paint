@@ -75,6 +75,8 @@ pub struct History {
     undo: Vec<Action>,
     redo: Vec<Action>,
     limit: usize,
+    /// Changes with every edit, undo and redo; used to detect unsaved changes.
+    version: u64,
 }
 
 impl History {
@@ -83,11 +85,17 @@ impl History {
             undo: Vec::new(),
             redo: Vec::new(),
             limit,
+            version: 0,
         }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Records the action that reverts an edit that was just made.
     pub fn push(&mut self, revert: Action) {
+        self.version += 1;
         self.redo.clear();
         self.undo.push(revert);
         if self.undo.len() > self.limit {
@@ -112,12 +120,14 @@ impl History {
 
     pub fn undo(&mut self, layers: &mut Vec<Layer>) {
         if let Some(inv) = self.undo.pop().and_then(|a| a.apply(layers)) {
+            self.version += 1;
             self.redo.push(inv);
         }
     }
 
     pub fn redo(&mut self, layers: &mut Vec<Layer>) {
         if let Some(inv) = self.redo.pop().and_then(|a| a.apply(layers)) {
+            self.version += 1;
             self.undo.push(inv);
         }
     }
