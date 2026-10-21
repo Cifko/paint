@@ -573,21 +573,19 @@ impl ShapeKind {
 
     /// Whether the shape is drawn by dragging out a bounding box.
     pub fn is_boxed(self) -> bool {
-        matches!(
-            self,
-            Self::Rectangle | Self::Ellipse | Self::Triangle | Self::NGon
-        )
+        matches!(self, Self::Rectangle | Self::Ellipse | Self::Triangle)
+    }
+
+    /// Whether the shape can be filled instead of outlined.
+    pub fn can_fill(self) -> bool {
+        self.is_boxed() || self == Self::NGon
     }
 
     /// Height / width when snapped to a regular shape (square, circle,
-    /// equilateral triangle, an n-gon's own proportions for `sides`).
-    pub fn regular_ratio(self, sides: u32) -> f32 {
+    /// equilateral triangle).
+    pub fn regular_ratio(self) -> f32 {
         match self {
             Self::Triangle => 3f32.sqrt() / 2.0,
-            Self::NGon => {
-                let [w, h] = ngon_size(sides);
-                h / w
-            }
             _ => 1.0,
         }
     }
@@ -603,46 +601,57 @@ pub fn triangle_points(r: IRect) -> [[f32; 2]; 3] {
     ]
 }
 
-/// Corners of a regular `sides`-gon on the unit circle, with a flat edge at
-/// the bottom (so 4 gives a square, 6 a flat-topped hexagon).
-fn ngon_unit(sides: u32) -> Vec<[f32; 2]> {
+/// The vertex of a regular `sides`-gon that's placed together with vertex 0.
+pub fn ngon_far_vertex(sides: u32) -> u32 {
+    sides.max(3) / 2
+}
+
+/// Corners of the regular `sides`-gon whose vertex 0 is at `v0` and whose
+/// vertex `sides / 2` (rounded down) is at `vk`. For odd counts the polygon
+/// lies to the left of the direction from `v0` to `vk` (below it when that
+/// points right), so a left-to-right drag gives an upright shape.
+pub fn ngon_from_vertices(v0: [f32; 2], vk: [f32; 2], sides: u32) -> Vec<[f32; 2]> {
     let n = sides.max(3);
+    let k = ngon_far_vertex(n);
+    let (dx, dy) = (vk[0] - v0[0], vk[1] - v0[1]);
+    let chord = dx.hypot(dy);
+    if chord < 1e-3 {
+        return Vec::new();
+    }
+    // The chord spans k of the n equal steps around the circumscribed circle.
+    let half_angle = std::f32::consts::PI * k as f32 / n as f32;
+    let radius = chord / 2.0 / half_angle.sin();
+    let apothem = radius * half_angle.cos();
+    let (ux, uy) = (dx / chord, dy / chord);
+    // Perpendicular pointing "down" for a rightward chord (screen y grows down).
+    let (px, py) = (-uy, ux);
+    let center = [
+        (v0[0] + vk[0]) / 2.0 + px * apothem,
+        (v0[1] + vk[1]) / 2.0 + py * apothem,
+    ];
+    let start = (v0[1] - center[1]).atan2(v0[0] - center[0]);
+    // Walk round the circle in the direction that lands vertex k on `vk`.
     let step = std::f32::consts::TAU / n as f32;
-    // A corner straight down would leave no flat bottom; turn half a step.
-    let start = std::f32::consts::FRAC_PI_2 + if n.is_multiple_of(2) { step / 2.0 } else { 0.0 };
-    (0..n)
-        .map(|i| {
-            let a = start + i as f32 * step;
-            [a.cos(), -a.sin()]
-        })
-        .collect()
-}
-
-/// Width and height of the unit n-gon.
-fn ngon_size(sides: u32) -> [f32; 2] {
-    let pts = ngon_unit(sides);
-    let span = |i: usize| {
-        let (lo, hi) = pts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
-            (lo.min(p[i]), hi.max(p[i]))
-        });
-        hi - lo
+    let at = |dir: f32, i: u32| {
+        let a = start + dir * step * i as f32;
+        [center[0] + radius * a.cos(), center[1] + radius * a.sin()]
     };
-    [span(0), span(1)]
+    let miss = |dir: f32| {
+        let p = at(dir, k);
+        (p[0] - vk[0]).hypot(p[1] - vk[1])
+    };
+    let dir = if miss(1.0) <= miss(-1.0) { 1.0 } else { -1.0 };
+    (0..n).map(|i| at(dir, i)).collect()
 }
 
-/// Corners of the largest regular `sides`-gon fitting in `r`, centered in it.
-pub fn ngon_points(r: IRect, sides: u32) -> Vec<[f32; 2]> {
-    let unit = ngon_unit(sides);
-    let [uw, uh] = ngon_size(sides);
-    let scale = (r.width() as f32 / uw).min(r.height() as f32 / uh);
-    // Center the polygon's own bounding box in `r`.
-    let min_x = unit.iter().map(|p| p[0]).fold(f32::MAX, f32::min);
-    let min_y = unit.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
-    let x0 = (r.x0 + r.x1) as f32 / 2.0 - uw * scale / 2.0;
-    let y0 = (r.y0 + r.y1) as f32 / 2.0 - uh * scale / 2.0;
-    unit.iter()
-        .map(|p| [x0 + (p[0] - min_x) * scale, y0 + (p[1] - min_y) * scale])
-        .collect()
+/// Rotates `end` around `start` to the nearest multiple of `degrees`,
+/// keeping its distance.
+pub fn snap_rotation(start: [f32; 2], end: [f32; 2], degrees: f32) -> [f32; 2] {
+    let (dx, dy) = (end[0] - start[0], end[1] - start[1]);
+    let step = degrees.to_radians();
+    let angle = (dy.atan2(dx) / step).round() * step;
+    let len = dx.hypot(dy);
+    [start[0] + len * angle.cos(), start[1] + len * angle.sin()]
 }
 
 /// Moves `end` so the line from `start` points in a multiple of 45°.
@@ -1792,17 +1801,15 @@ mod tests {
     }
 
     #[test]
-    fn ngon_is_regular_and_fits() {
+    fn ngon_through_two_vertices() {
         for n in [3u32, 4, 5, 6, 7, 12, 20] {
-            let r = IRect {
-                x0: 10,
-                y0: 20,
-                x1: 210,
-                y1: 120,
-            };
-            let pts = ngon_points(r, n);
+            let (v0, vk) = ([10.0, 50.0], [110.0, 30.0]);
+            let pts = ngon_from_vertices(v0, vk, n);
             assert_eq!(pts.len(), n as usize);
-            // All sides equal.
+            let k = ngon_far_vertex(n) as usize;
+            let close = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 0.01;
+            assert!(close(pts[0], v0), "n={n}: vertex 0 at {:?}", pts[0]);
+            assert!(close(pts[k], vk), "n={n}: vertex {k} at {:?}", pts[k]);
             let side = |i: usize| {
                 let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
                 (a[0] - b[0]).hypot(a[1] - b[1])
@@ -1810,34 +1817,16 @@ mod tests {
             for i in 1..pts.len() {
                 assert!((side(i) - side(0)).abs() < 0.01, "n={n}: uneven sides");
             }
-            // Inside the box, touching it on two opposite sides.
-            for p in &pts {
-                assert!(
-                    p[0] >= 9.99 && p[0] <= 210.01 && p[1] >= 19.99 && p[1] <= 120.01,
-                    "n={n}: {p:?}"
-                );
-            }
-            // A flat bottom edge.
-            let max_y = pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
-            assert_eq!(
-                pts.iter().filter(|p| (p[1] - max_y).abs() < 0.01).count(),
-                2,
-                "n={n}"
-            );
         }
-        // A square for n = 4.
-        let sq = ngon_points(
-            IRect {
-                x0: 0,
-                y0: 0,
-                x1: 100,
-                y1: 100,
-            },
-            4,
-        );
+        // A left-to-right pentagon stands upright: its peak (vertex 1) is above.
+        let pent = ngon_from_vertices([0.0, 0.0], [100.0, 0.0], 5);
+        assert!(pent[1][1] < 0.0 && pent[3][1] > 0.0, "{pent:?}");
+        // Even counts: the two points are opposite corners (a square's diagonal).
+        let sq = ngon_from_vertices([0.0, 0.0], [10.0, 10.0], 4);
         assert!(
             sq.iter()
-                .all(|p| p[0].abs() < 0.01 || (p[0] - 100.0).abs() < 0.01)
+                .any(|p| (p[0] - 10.0).abs() < 0.01 && p[1].abs() < 0.01)
         );
+        assert!(ngon_from_vertices([1.0, 1.0], [1.0, 1.0], 6).is_empty());
     }
 }
