@@ -11,7 +11,8 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 - **Open / save** PNG, JPEG and BMP (File menu, `Ctrl+O` / `Ctrl+S`, drag a file onto
   the window, or `paint image.png`). Saving flattens the visible layers and crops to
   what's drawn; PNG keeps transparency, JPEG/BMP get a white background.
-- **Tools** – Brush, Eraser, Flood fill, Rectangle and Ellipse (outline or filled),
+- **Tools** – Brush, Eraser, Flood fill, Shapes (rectangle, ellipse, triangle – outline
+  or filled – line and polyline),
   Grid, rectangle Select, Text.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
@@ -37,8 +38,9 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | Pan | Middle mouse drag, or Space + left drag |
 | Zoom | Mouse wheel / pinch (around the cursor) |
 | Brush / Eraser / Fill | `B` / `E` / `G` |
-| Rectangle / Ellipse / Grid / Select / Text | `R` / `C` / `H` / `M` / `T` |
-| Snap rectangle, ellipse, cell, grid or selection to a square / circle | Hold `Shift` while drawing (configurable) |
+| Shape tool / Grid / Select / Text | `S` / `H` / `M` / `T` |
+| Rectangle / Ellipse / Line / Polyline | `R` / `C` / `L` / `P` |
+| Snap to square / circle / equilateral triangle, lines to 45° steps | Hold `Shift` while drawing (configurable) |
 | Select everything that's painted | `Ctrl+A` |
 | Change brush size | Hold `Alt` (`Option` on macOS) + drag left/right or scroll (configurable) |
 | Copy selection (active layer) | `Ctrl+C` |
@@ -55,8 +57,11 @@ elsewhere or switching tools places the text; `Ctrl+Z` while typing discards it.
 size slider sets the font size; the font is chosen in the side panel (DejaVu fonts,
 bundled).
 
-Rectangle and Ellipse: drag from corner to corner of the shape's bounding box. The pen
-size is the outline width.
+Shapes: pick one with the small arrow next to the shape button. Rectangle, ellipse and
+triangle: drag from corner to corner of the bounding box. Line: drag from end to end.
+Polyline: click to add points, double-click or `Enter` to finish, click the first point
+to close it; `Ctrl+Z` removes the last point, `Esc` cancels. The pen size is the line
+width.
 
 The selection belongs to the Select tool: it's only shown (and only used by copy, cut
 and delete) while that tool is active.
