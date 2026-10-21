@@ -8,7 +8,7 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 
 - **Infinite canvas** – paint anywhere; pan and zoom freely. 100% zoom is pixel-for-pixel
   with the screen, also on displays with OS scaling (e.g. 150% on Windows).
-- **Tools** – Brush, Eraser, Flood fill, Rectangle and Circle (outline or filled),
+- **Tools** – Brush, Eraser, Flood fill, Rectangle and Ellipse (outline or filled),
   Grid, rectangle Select.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
@@ -28,8 +28,9 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | Pan | Middle mouse drag, or Space + left drag |
 | Zoom | Mouse wheel / pinch (around the cursor) |
 | Brush / Eraser / Fill | `B` / `E` / `G` |
-| Rectangle / Circle / Grid / Select | `R` / `C` / `T` / `M` |
-| Snap rectangle, cell, grid or selection to a square | Hold `Shift` while drawing (configurable) |
+| Rectangle / Ellipse / Grid / Select | `R` / `C` / `T` / `M` |
+| Snap rectangle, ellipse, cell, grid or selection to a square / circle | Hold `Shift` while drawing (configurable) |
+| Select everything that's painted | `Ctrl+A` |
 | Change brush size | Hold `Alt` (`Option` on macOS) + drag left/right or scroll (configurable) |
 | Copy selection (active layer) | `Ctrl+C` |
 | Copy selection (all visible layers) | `Ctrl+Shift+C` |
@@ -39,8 +40,11 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | Undo | `Ctrl+Z` (`Cmd+Z` on macOS) |
 | Redo | `Ctrl+Shift+Z` or `Ctrl+Y` |
 
-Circle: press at the center and drag out the radius. Rectangle: drag from corner to
-corner. For both, the pen size is the outline width.
+Rectangle and Ellipse: drag from corner to corner of the shape's bounding box. The pen
+size is the outline width.
+
+The selection belongs to the Select tool: it's only shown (and only used by copy, cut
+and delete) while that tool is active.
 
 Grid: click where the grid starts, move the mouse to size one cell, click, then move
 to size the whole grid and click again. As many whole cells as fit are drawn (e.g. a

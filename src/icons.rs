@@ -8,7 +8,7 @@ pub enum Icon {
     Eraser,
     Fill,
     Rectangle,
-    Circle,
+    Ellipse,
     Grid,
     Select,
 }
@@ -78,8 +78,14 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 StrokeKind::Middle,
             );
         }
-        Icon::Circle => {
-            painter.circle_stroke(p(0.5, 0.5), s * 0.38, thin);
+        Icon::Ellipse => {
+            let pts: Vec<Pos2> = (0..=48)
+                .map(|i| {
+                    let t = i as f32 / 48.0 * std::f32::consts::TAU;
+                    p(0.5 + 0.40 * t.cos(), 0.5 + 0.30 * t.sin())
+                })
+                .collect();
+            painter.add(Shape::line(pts, thin));
         }
         Icon::Grid => {
             for i in 0..4 {

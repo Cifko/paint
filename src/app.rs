@@ -17,7 +17,7 @@ enum Tool {
     Eraser,
     Fill,
     Rectangle,
-    Circle,
+    Ellipse,
     Grid,
     Select,
 }
@@ -28,7 +28,7 @@ impl Tool {
         (Tool::Eraser, "Eraser", Key::E, Icon::Eraser),
         (Tool::Fill, "Fill", Key::G, Icon::Fill),
         (Tool::Rectangle, "Rectangle", Key::R, Icon::Rectangle),
-        (Tool::Circle, "Circle", Key::C, Icon::Circle),
+        (Tool::Ellipse, "Ellipse", Key::C, Icon::Ellipse),
         (Tool::Grid, "Grid", Key::T, Icon::Grid),
         (Tool::Select, "Select", Key::M, Icon::Select),
     ];
@@ -49,8 +49,8 @@ enum Gesture {
         op: PaintOp,
         last: [f32; 2],
     },
-    Circle {
-        center: [f32; 2],
+    Ellipse {
+        start: [i32; 2],
     },
     Rectangle {
         start: [i32; 2],
@@ -191,6 +191,13 @@ pub struct PaintApp {
     gesture: Option<Gesture>,
     textures: HashMap<(LayerId, TileKey), TextureHandle>,
 
+    /// Scratch layer showing the shape being dragged out, rendered with the
+    /// same code as the final shape so the preview matches it exactly.
+    preview: Layer,
+    preview_textures: HashMap<TileKey, TextureHandle>,
+    /// Inputs of the current preview, to skip re-rendering when unchanged.
+    preview_key: Option<(IRect, f32, bool, [u8; 4], f32)>,
+
     thumbs: HashMap<LayerId, TextureHandle>,
     /// Tight bounds of the painted pixels in each tile, for framing thumbnails.
     content_bounds: HashMap<(LayerId, TileKey), IRect>,
@@ -229,6 +236,9 @@ impl PaintApp {
             canvas_hover: None,
             gesture: None,
             textures: HashMap::new(),
+            preview: Layer::new(0, "preview"),
+            preview_textures: HashMap::new(),
+            preview_key: None,
             thumbs: HashMap::new(),
             content_bounds: HashMap::new(),
             thumbs_dirty: true,
@@ -294,14 +304,19 @@ impl PaintApp {
         let redo_b = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
         let undo = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
         let copy_merged = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::C);
-        let (do_redo, do_undo, do_copy_merged) = ctx.input_mut(|i| {
+        let select_all = KeyboardShortcut::new(Modifiers::COMMAND, Key::A);
+        let (do_redo, do_undo, do_copy_merged, do_select_all) = ctx.input_mut(|i| {
             let redo = i.consume_shortcut(&redo_a) || i.consume_shortcut(&redo_b);
             (
                 redo,
                 i.consume_shortcut(&undo),
                 i.consume_shortcut(&copy_merged),
+                i.consume_shortcut(&select_all),
             )
         });
+        if do_select_all {
+            self.select_all();
+        }
         if do_copy_merged {
             self.copy(ctx, true);
         }
@@ -406,7 +421,7 @@ impl PaintApp {
             }
             ui.separator();
 
-            let can_copy = self.selection.is_some() || self.floating.is_some();
+            let can_copy = self.active_selection().is_some() || self.floating.is_some();
             if ui
                 .add_enabled(can_copy, egui::Button::new("Copy"))
                 .on_hover_text("Copy from the active layer (Ctrl+C)")
@@ -449,21 +464,35 @@ impl PaintApp {
             .anchor(Align2::LEFT_CENTER, [10.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_width(64.0);
-                ui.vertical(|ui| {
+                // The slider's built-in value box would pull it to the left, so
+                // the value gets its own box below the slider.
+                ui.vertical_centered(|ui| {
                     ui.label("Size");
-                    ui.add(
+                    centered_slider(
+                        ui,
                         egui::Slider::new(&mut self.size, MIN_SIZE..=MAX_SIZE)
                             .vertical()
                             .logarithmic(true)
-                            .integer(),
+                            .show_value(false),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.size)
+                            .range(MIN_SIZE..=MAX_SIZE)
+                            .max_decimals(0),
                     );
                     ui.add_space(8.0);
                     ui.label("Opacity");
                     let mut pct = self.opacity * 100.0;
-                    ui.add(
+                    centered_slider(
+                        ui,
                         egui::Slider::new(&mut pct, 1.0..=100.0)
                             .vertical()
-                            .integer()
+                            .show_value(false),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut pct)
+                            .range(1.0..=100.0)
+                            .max_decimals(0)
                             .suffix("%"),
                     );
                     self.opacity = pct / 100.0;
@@ -474,7 +503,7 @@ impl PaintApp {
                         ui.label("Tolerance");
                         ui.add(egui::DragValue::new(&mut self.fill_tolerance).range(0..=255));
                     }
-                    Tool::Circle | Tool::Rectangle => {
+                    Tool::Ellipse | Tool::Rectangle => {
                         ui.separator();
                         ui.checkbox(&mut self.fill_shapes, "Filled");
                     }
@@ -608,7 +637,7 @@ impl PaintApp {
     /// `merged`, copies what's visible across all layers instead of just the
     /// active one.
     fn copy(&mut self, ctx: &egui::Context, merged: bool) {
-        let image = match (&self.floating, self.selection) {
+        let image = match (&self.floating, self.active_selection()) {
             (Some(f), _) => f.image.clone(),
             (None, Some(sel)) if merged => canvas::copy_region_merged(&self.layers, sel),
             (None, Some(sel)) => canvas::copy_region(&self.layers[self.active], sel),
@@ -622,7 +651,9 @@ impl PaintApp {
     }
 
     fn delete_selection(&mut self) {
-        let Some(sel) = self.selection else { return };
+        let Some(sel) = self.active_selection() else {
+            return;
+        };
         let mut op = PaintOp::new(self.active_layer_id(), PaintMode::Erase { strength: 1.0 });
         op.apply(&mut self.layers[self.active], sel, |_, _| 1.0);
         self.commit(op);
@@ -707,6 +738,26 @@ impl PaintApp {
         )
     }
 
+    /// The selection, which only exists for the user while the Select tool is
+    /// active: other tools neither show it nor act on it.
+    fn active_selection(&self) -> Option<IRect> {
+        self.selection.filter(|_| self.tool == Tool::Select)
+    }
+
+    /// Selects everything painted on any layer.
+    fn select_all(&mut self) {
+        self.place_floating();
+        let all = self
+            .content_bounds
+            .values()
+            .copied()
+            .reduce(|a, b| a.union(&b));
+        if all.is_some() {
+            self.tool = Tool::Select;
+            self.selection = all;
+        }
+    }
+
     fn square_held(&self) -> bool {
         self.settings.square_modifier.is_held(self.modifiers)
     }
@@ -740,6 +791,7 @@ impl PaintApp {
         self.canvas_hover = response.hover_pos();
         self.handle_view_input(ui, rect, &response);
         self.handle_tool_input(ui, rect);
+        self.update_preview(ui, rect);
         self.sync_textures(ui.ctx());
         self.paint_canvas(ui, rect, &response);
     }
@@ -920,7 +972,10 @@ impl PaintApp {
                 op.stroke_segment(&mut self.layers[self.active], p, p, self.size / 2.0);
                 self.gesture = Some(Gesture::Stroke { op, last: p });
             }
-            Tool::Circle => self.gesture = Some(Gesture::Circle { center: p }),
+            Tool::Ellipse => {
+                let start = [p[0].round() as i32, p[1].round() as i32];
+                self.gesture = Some(Gesture::Ellipse { start });
+            }
             Tool::Rectangle => {
                 let start = [p[0].round() as i32, p[1].round() as i32];
                 self.gesture = Some(Gesture::Rectangle { start });
@@ -993,18 +1048,17 @@ impl PaintApp {
     fn finish_gesture_at(&mut self, rect: Rect, pos: Option<Pos2>) {
         match self.gesture.take() {
             Some(Gesture::Stroke { op, .. }) => self.commit(op),
-            Some(Gesture::Circle { center }) => {
+            Some(Gesture::Ellipse { start }) => {
                 let Some(pos) = pos else { return };
-                let p = self.to_canvas(rect, pos);
-                let radius = ((p[0] - center[0]).powi(2) + (p[1] - center[1]).powi(2)).sqrt();
-                if radius < 0.5 {
+                let end = self.rect_end(start, self.to_canvas(rect, pos));
+                let r = canvas::rect_from_corners(start, end);
+                if r.width() <= 0 || r.height() <= 0 {
                     return;
                 }
                 let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
-                op.circle(
+                op.ellipse(
                     &mut self.layers[self.active],
-                    center,
-                    radius,
+                    r,
                     self.size,
                     self.fill_shapes,
                 );
@@ -1114,6 +1168,54 @@ impl PaintApp {
         }
     }
 
+    /// Renders the ellipse being dragged out into the preview layer.
+    fn update_preview(&mut self, ui: &egui::Ui, rect: Rect) {
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        let key = match (&self.gesture, pointer) {
+            (Some(Gesture::Ellipse { start }), Some(pos)) => {
+                let end = self.rect_end(*start, self.to_canvas(rect, pos));
+                let r = canvas::rect_from_corners(*start, end);
+                Some((
+                    r,
+                    self.size,
+                    self.fill_shapes,
+                    self.color.to_array(),
+                    self.opacity,
+                ))
+            }
+            _ => None,
+        };
+        if key == self.preview_key {
+            return;
+        }
+        self.preview_key = key;
+        self.preview.tiles.clear();
+        if let Some((r, size, filled, _, _)) = key
+            && r.width() > 0
+            && r.height() > 0
+        {
+            let mut op = PaintOp::new(self.preview.id, self.paint_mode());
+            op.ellipse(&mut self.preview, r, size, filled);
+        }
+        self.preview.dirty.clear();
+        let ctx = ui.ctx();
+        self.preview_textures
+            .retain(|k, _| self.preview.tiles.contains_key(k));
+        for (key, tile) in &self.preview.tiles {
+            let image = ColorImage::from_rgba_unmultiplied(
+                [TILE as usize, TILE as usize],
+                tile.as_flattened(),
+            );
+            match self.preview_textures.get_mut(key) {
+                Some(tex) => tex.set(image, TEXTURE_OPTIONS),
+                None => {
+                    let tex = ctx.load_texture("preview", image, TEXTURE_OPTIONS);
+                    self.preview_textures.insert(*key, tex);
+                }
+            }
+        }
+    }
+
     fn update_thumbnails(&mut self, ctx: &egui::Context) {
         // All layers share one frame so the previews line up with each other.
         let region = self
@@ -1170,7 +1272,20 @@ impl PaintApp {
                     painter.image(tex.id(), self.screen_rect_of(rect, r), uv, tint);
                 }
             }
-            // The pasted image previews where it will land: right above the active layer.
+            // Shape previews and pasted images show where they will land:
+            // right above the active layer.
+            if index == self.active && layer.visible {
+                let tint = Color32::from_white_alpha((layer.opacity * 255.0).round() as u8);
+                for (key, tex) in &self.preview_textures {
+                    let r = IRect {
+                        x0: key.0 * TILE,
+                        y0: key.1 * TILE,
+                        x1: (key.0 + 1) * TILE,
+                        y1: (key.1 + 1) * TILE,
+                    };
+                    painter.image(tex.id(), self.screen_rect_of(rect, r), uv, tint);
+                }
+            }
             if index == self.active
                 && let Some(f) = &self.floating
             {
@@ -1188,7 +1303,7 @@ impl PaintApp {
 
         if let Some(f) = &self.floating {
             marching_ants(&painter, self.screen_rect_of(rect, f.rect()));
-        } else if let Some(sel) = self.selection {
+        } else if let Some(sel) = self.active_selection() {
             marching_ants(&painter, self.screen_rect_of(rect, sel));
         }
 
@@ -1196,19 +1311,6 @@ impl PaintApp {
         let pointer = ui.input(|i| i.pointer.latest_pos());
         let color = self.color.gamma_multiply(self.opacity);
         let pen = Stroke::new(self.size * self.scale(), color);
-        // Circle preview.
-        if let Some(Gesture::Circle { center }) = &self.gesture
-            && let Some(pos) = pointer
-        {
-            let c = self.to_screen(rect, *center);
-            let r = c.distance(pos);
-            if self.fill_shapes {
-                painter.circle_filled(c, r, color);
-            } else {
-                painter.circle_stroke(c, r, pen);
-            }
-        }
-
         // Rectangle preview, and the size of whatever rectangle is being dragged.
         if let Some(pos) = pointer {
             let p = self.to_canvas(rect, pos);
@@ -1221,6 +1323,10 @@ impl PaintApp {
                     } else {
                         painter.rect_stroke(sr, 0.0, pen, egui::StrokeKind::Middle);
                     }
+                    info_label(&painter, pos, format!("{} × {}", r.width(), r.height()));
+                }
+                Some(Gesture::Ellipse { start }) => {
+                    let r = canvas::rect_from_corners(*start, self.rect_end(*start, p));
                     info_label(&painter, pos, format!("{} × {}", r.width(), r.height()));
                 }
                 Some(Gesture::Select { .. }) => {
@@ -1295,7 +1401,7 @@ impl PaintApp {
                 Tool::Brush | Tool::Eraser => {
                     painter.circle_stroke(pos, (self.size / 2.0 * self.scale()).max(1.0), outline);
                 }
-                Tool::Circle | Tool::Fill | Tool::Select | Tool::Rectangle | Tool::Grid => {
+                Tool::Ellipse | Tool::Fill | Tool::Select | Tool::Rectangle | Tool::Grid => {
                     painter.line_segment([pos - Vec2::X * 6.0, pos + Vec2::X * 6.0], outline);
                     painter.line_segment([pos - Vec2::Y * 6.0, pos + Vec2::Y * 6.0], outline);
                 }
@@ -1345,6 +1451,19 @@ impl PaintApp {
             painter.line_segment([at(0, r), at(cols, r)], pen);
         }
     }
+}
+
+/// Adds a vertical slider so a centered parent layout can center it (the
+/// slider itself always lays out left-aligned within whatever it is given).
+fn centered_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egui::Response {
+    let thickness = ui
+        .text_style_height(&egui::TextStyle::Body)
+        .max(ui.spacing().interact_size.y);
+    let size = Vec2::new(thickness, ui.spacing().slider_width);
+    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.add(slider)
+    })
+    .inner
 }
 
 /// Draws a small text label with a background next to the pointer.
