@@ -897,6 +897,60 @@ impl PaintApp {
         }
     }
 
+    /// The small arrow next to the grid button, opening a list of grid shapes.
+    fn grid_kind_dropdown(&mut self, ui: &mut egui::Ui) {
+        let (rect, arrow) = ui.allocate_exact_size(Vec2::new(12.0, 28.0), Sense::click());
+        let arrow = arrow.on_hover_text("Grid shape");
+        let color = if arrow.hovered() {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().text_color()
+        };
+        let c = rect.center();
+        ui.painter().add(Shape::convex_polygon(
+            vec![
+                c + Vec2::new(-4.0, -2.0),
+                c + Vec2::new(4.0, -2.0),
+                c + Vec2::new(0.0, 3.0),
+            ],
+            color,
+            Stroke::NONE,
+        ));
+        egui::Popup::menu(&arrow).show(|ui| {
+            for kind in GridKind::ALL {
+                let (row, resp) = ui.allocate_exact_size(Vec2::new(140.0, 26.0), Sense::click());
+                let visuals = ui.visuals();
+                if kind == self.grid_kind || resp.hovered() {
+                    let fill = if kind == self.grid_kind {
+                        visuals.selection.bg_fill
+                    } else {
+                        visuals.widgets.hovered.weak_bg_fill
+                    };
+                    ui.painter().rect_filled(row, 4.0, fill);
+                }
+                let text_color = visuals.text_color();
+                let icon_rect =
+                    Rect::from_min_size(row.min + Vec2::new(4.0, 3.0), Vec2::splat(20.0));
+                icons::paint(ui.painter(), icon_rect, grid_icon(kind), text_color);
+                ui.painter().text(
+                    row.left_center() + Vec2::new(30.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    kind.label(),
+                    egui::FontId::proportional(14.0),
+                    text_color,
+                );
+                if resp.clicked() {
+                    if self.grid_kind != kind {
+                        self.grid = None;
+                    }
+                    self.grid_kind = kind;
+                    self.tool = Tool::Grid;
+                    ui.close();
+                }
+            }
+        });
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("File", |ui| {
@@ -923,31 +977,20 @@ impl PaintApp {
             });
             ui.separator();
             for (tool, name, key, icon) in Tool::ALL {
+                // The grid button shows the chosen grid shape.
+                let icon = if tool == Tool::Grid {
+                    grid_icon(self.grid_kind)
+                } else {
+                    icon
+                };
                 if icon_button(ui, icon, self.tool == tool)
                     .on_hover_text(format!("{name} ({})", key.name()))
                     .clicked()
                 {
                     self.tool = tool;
                 }
-            }
-            ui.separator();
-            // Grid shape; picking one also switches to the Grid tool.
-            for kind in GridKind::ALL {
-                let icon = match kind {
-                    GridKind::Rectangle => Icon::Grid,
-                    GridKind::Triangle => Icon::TriangleGrid,
-                    GridKind::Hexagon => Icon::HexagonGrid,
-                };
-                let selected = self.tool == Tool::Grid && self.grid_kind == kind;
-                if icon_button(ui, icon, selected)
-                    .on_hover_text(format!("Grid of {}", kind.label().to_lowercase()))
-                    .clicked()
-                {
-                    if self.grid_kind != kind {
-                        self.grid = None;
-                    }
-                    self.grid_kind = kind;
-                    self.tool = Tool::Grid;
+                if tool == Tool::Grid {
+                    self.grid_kind_dropdown(ui);
                 }
             }
             ui.separator();
@@ -2283,6 +2326,14 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool) -> egui::Response 
     ui.painter().rect_filled(rect, 4.0, bg);
     icons::paint(ui.painter(), rect.shrink(5.0), icon, fg);
     resp
+}
+
+fn grid_icon(kind: GridKind) -> Icon {
+    match kind {
+        GridKind::Rectangle => Icon::Grid,
+        GridKind::Triangle => Icon::TriangleGrid,
+        GridKind::Hexagon => Icon::HexagonGrid,
+    }
 }
 
 /// Fills `rect` with `color`; the clear color is shown as white with a red slash.
