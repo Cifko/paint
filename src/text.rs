@@ -5,7 +5,7 @@
 
 use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont, point};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FontFace {
     Sans,
     SansBold,

@@ -23,3 +23,6 @@ opt-level = 2
 
 [profile.release]
 lto = "thin"
+
+[dev-dependencies]
+ron = "0.12"

@@ -32,11 +32,17 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 
 ## Controls
 
+These are the default shortcuts; every one of them can be changed in **Settings →
+Keyboard shortcuts** (click a shortcut and press the new keys). Settings also hold the
+values tools start with (sizes, opacities, font, colors, …), each with its own reset
+button, plus "Restore all defaults".
+
 | Action | Input |
 | --- | --- |
 | Paint / use tool | Left mouse button (color 1), right mouse button (color 2) |
 | Swap color 1 and 2 | `X` |
 | New / open / save / save as | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` |
+| Fit everything drawn into the window (max 100%) / reset view | `Ctrl+0` / `Ctrl+1` |
 | Pan | Middle mouse drag, or Space + left drag |
 | Zoom | Mouse wheel / pinch (around the cursor) |
 | Brush / Eraser / Fill | `B` / `E` / `G` |
@@ -128,4 +134,5 @@ Code layout:
 - `src/floating.rs` – pasted / lifted pieces and their transform handles.
 - `src/file.rs` – loading and saving images.
 - `src/text.rs` – text tool fonts, layout and editing.
+- `src/shortcuts.rs` – rebindable keyboard shortcuts.
 - `src/settings.rs` – user preferences (saved between runs).
