@@ -1291,14 +1291,22 @@ impl PaintApp {
     fn sync_textures(&mut self, ctx: &egui::Context) {
         for layer in &mut self.layers {
             if std::mem::take(&mut layer.default_changed) {
+                // Content is whatever differs from the default color, so every
+                // tile's bounds change with it.
                 self.thumbs_dirty = true;
+                for (&key, tile) in &layer.tiles {
+                    match canvas::tile_content_bounds(key, tile, layer.default) {
+                        Some(b) => self.content_bounds.insert((layer.id, key), b),
+                        None => self.content_bounds.remove(&(layer.id, key)),
+                    };
+                }
             }
             for key in layer.dirty.drain() {
                 let tex_key = (layer.id, key);
                 self.thumbs_dirty = true;
                 match layer.tiles.get(&key) {
                     Some(tile) => {
-                        match canvas::tile_content_bounds(key, tile) {
+                        match canvas::tile_content_bounds(key, tile, layer.default) {
                             Some(b) => self.content_bounds.insert(tex_key, b),
                             None => self.content_bounds.remove(&tex_key),
                         };
