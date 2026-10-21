@@ -2,6 +2,7 @@
 
 mod app;
 mod canvas;
+mod file;
 mod history;
 mod icons;
 mod settings;
@@ -17,6 +18,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Paint",
         options,
-        Box::new(|cc| Ok(Box::new(app::PaintApp::new(cc)))),
+        Box::new(|cc| {
+            let mut app = app::PaintApp::new(cc);
+            // Opening an image from the command line / "Open with".
+            if let Some(path) = std::env::args_os().nth(1) {
+                app.open_path(path.into());
+            }
+            Ok(Box::new(app))
+        }),
     )
 }

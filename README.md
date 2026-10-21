@@ -8,6 +8,9 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 
 - **Infinite canvas** – paint anywhere; pan and zoom freely. 100% zoom is pixel-for-pixel
   with the screen, also on displays with OS scaling (e.g. 150% on Windows).
+- **Open / save** PNG, JPEG and BMP (File menu, `Ctrl+O` / `Ctrl+S`, drag a file onto
+  the window, or `paint image.png`). Saving flattens the visible layers and crops to
+  what's drawn; PNG keeps transparency, JPEG/BMP get a white background.
 - **Tools** – Brush, Eraser, Flood fill, Rectangle and Ellipse (outline or filled),
   Grid, rectangle Select, Text.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
@@ -30,6 +33,7 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 | --- | --- |
 | Paint / use tool | Left mouse button (color 1), right mouse button (color 2) |
 | Swap color 1 and 2 | `X` |
+| New / open / save / save as | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` |
 | Pan | Middle mouse drag, or Space + left drag |
 | Zoom | Mouse wheel / pinch (around the cursor) |
 | Brush / Eraser / Fill | `B` / `E` / `G` |
@@ -57,9 +61,11 @@ size is the outline width.
 The selection belongs to the Select tool: it's only shown (and only used by copy, cut
 and delete) while that tool is active.
 
-Grid: click where the grid starts, move the mouse to size one cell, click, then move
+Grid: pick the cell shape (rectangles, triangles or hexagons) in the toolbar next to
+the tools, click where the grid starts, move the mouse to size one cell, click, then move
 to size the whole grid and click again. As many whole cells as fit are drawn (e.g. a
-3×7 cell in a 10×20 area gives 3×2 cells); the count is shown while you move.
+3×7 cell in a 10×20 area gives 3×2 cells); the count is shown while you move. With
+`Shift` the cell becomes regular (square, equilateral triangle, regular hexagon).
 `Esc` cancels.
 
 Pasted images float above the active layer until placed; drag them to move.
@@ -100,4 +106,6 @@ Code layout:
 - `src/canvas.rs` – tiled infinite layers, brush/circle rasterization, flood fill,
   copy/paste and thumbnails.
 - `src/history.rs` – undo/redo.
+- `src/file.rs` – loading and saving images.
+- `src/text.rs` – text tool fonts, layout and editing.
 - `src/settings.rs` – user preferences (saved between runs).

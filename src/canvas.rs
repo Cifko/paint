@@ -481,23 +481,154 @@ pub fn rect_from_corners(a: [i32; 2], b: [i32; 2]) -> IRect {
     }
 }
 
-/// Lays out a grid of `cell`-sized cells from `origin` towards `end`, fitting
-/// as many whole cells as possible (rounded down). Returns the top-left
-/// corner of the grid and its column and row counts.
-pub fn grid_layout(origin: [i32; 2], cell: [i32; 2], end: [i32; 2]) -> ([i32; 2], i32, i32) {
-    let cols = (end[0] - origin[0]).abs() / cell[0].max(1);
-    let rows = (end[1] - origin[1]).abs() / cell[1].max(1);
-    let x0 = if end[0] < origin[0] {
-        origin[0] - cols * cell[0]
-    } else {
-        origin[0]
-    };
-    let y0 = if end[1] < origin[1] {
-        origin[1] - rows * cell[1]
-    } else {
-        origin[1]
-    };
-    ([x0, y0], cols, rows)
+/// Shape of the cells drawn by the grid tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridKind {
+    Rectangle,
+    /// Rows of alternating up/down triangles; the lines run straight through.
+    Triangle,
+    /// Flat-top hexagons; every other column is shifted down half a cell.
+    Hexagon,
+}
+
+/// A line segment between two canvas points.
+pub type Segment = [[f32; 2]; 2];
+
+impl GridKind {
+    pub const ALL: [GridKind; 3] = [Self::Rectangle, Self::Triangle, Self::Hexagon];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rectangle => "Rectangles",
+            Self::Triangle => "Triangles",
+            Self::Hexagon => "Hexagons",
+        }
+    }
+
+    /// Height / width of a regular cell (square, equilateral triangle,
+    /// regular hexagon), used when snapping the cell.
+    pub fn regular_ratio(self) -> f32 {
+        match self {
+            Self::Rectangle => 1.0,
+            Self::Triangle | Self::Hexagon => 3f32.sqrt() / 2.0,
+        }
+    }
+
+    /// How many columns and rows of `cell`-sized cells fit in `area` (w, h).
+    pub fn fit(self, cell: [i32; 2], area: [i32; 2]) -> (i32, i32) {
+        let (w, h) = (cell[0].max(1) as f32, cell[1].max(1) as f32);
+        let (aw, ah) = (area[0] as f32, area[1] as f32);
+        match self {
+            Self::Rectangle => (area[0] / cell[0].max(1), area[1] / cell[1].max(1)),
+            Self::Triangle => {
+                // Neighboring triangles overlap by half a cell.
+                let cols = if aw >= w {
+                    (2.0 * aw / w).floor() as i32 - 1
+                } else {
+                    0
+                };
+                (cols, (ah / h).floor() as i32)
+            }
+            Self::Hexagon => {
+                let cols = if aw >= w {
+                    ((aw - w) / (0.75 * w)).floor() as i32 + 1
+                } else {
+                    0
+                };
+                let shift = if cols > 1 { h / 2.0 } else { 0.0 };
+                (cols, ((ah - shift) / h).floor().max(0.0) as i32)
+            }
+        }
+    }
+
+    /// Width and height covered by a grid of this many cells.
+    pub fn extent(self, cell: [i32; 2], cols: i32, rows: i32) -> [f32; 2] {
+        let (w, h) = (cell[0] as f32, cell[1] as f32);
+        let (c, r) = (cols as f32, rows as f32);
+        match self {
+            Self::Rectangle => [c * w, r * h],
+            Self::Triangle => [(c + 1.0) * w / 2.0, r * h],
+            Self::Hexagon => [
+                w + (c - 1.0) * 0.75 * w,
+                r * h + if cols > 1 { h / 2.0 } else { 0.0 },
+            ],
+        }
+    }
+
+    /// Lays out a grid from `origin` towards `end` (it grows in the direction
+    /// dragged), fitting as many whole cells as possible. Returns the top-left
+    /// corner and the column and row counts.
+    pub fn layout(self, origin: [i32; 2], cell: [i32; 2], end: [i32; 2]) -> ([f32; 2], i32, i32) {
+        let area = [(end[0] - origin[0]).abs(), (end[1] - origin[1]).abs()];
+        let (cols, rows) = self.fit(cell, area);
+        let [ew, eh] = self.extent(cell, cols, rows);
+        let x0 = origin[0] as f32 - if end[0] < origin[0] { ew } else { 0.0 };
+        let y0 = origin[1] as f32 - if end[1] < origin[1] { eh } else { 0.0 };
+        ([x0, y0], cols, rows)
+    }
+
+    /// The line segments of a grid (edges shared by cells may repeat).
+    pub fn segments(
+        self,
+        top_left: [f32; 2],
+        cell: [i32; 2],
+        cols: i32,
+        rows: i32,
+    ) -> Vec<Segment> {
+        let (x0, y0) = (top_left[0], top_left[1]);
+        let (w, h) = (cell[0] as f32, cell[1] as f32);
+        let mut out = Vec::new();
+        if cols <= 0 || rows <= 0 {
+            return out;
+        }
+        let mut polygon = |pts: &[[f32; 2]]| {
+            for i in 0..pts.len() {
+                out.push([pts[i], pts[(i + 1) % pts.len()]]);
+            }
+        };
+        match self {
+            Self::Rectangle => {
+                let [ew, eh] = self.extent(cell, cols, rows);
+                for c in 0..=cols {
+                    let x = x0 + c as f32 * w;
+                    out.push([[x, y0], [x, y0 + eh]]);
+                }
+                for r in 0..=rows {
+                    let y = y0 + r as f32 * h;
+                    out.push([[x0, y], [x0 + ew, y]]);
+                }
+            }
+            Self::Triangle => {
+                for r in 0..rows {
+                    for i in 0..cols {
+                        let (x, y) = (x0 + i as f32 * w / 2.0, y0 + r as f32 * h);
+                        if (i + r) % 2 == 0 {
+                            polygon(&[[x, y + h], [x + w / 2.0, y], [x + w, y + h]]);
+                        } else {
+                            polygon(&[[x, y], [x + w, y], [x + w / 2.0, y + h]]);
+                        }
+                    }
+                }
+            }
+            Self::Hexagon => {
+                for c in 0..cols {
+                    for r in 0..rows {
+                        let x = x0 + c as f32 * 0.75 * w;
+                        let y = y0 + r as f32 * h + if c % 2 == 1 { h / 2.0 } else { 0.0 };
+                        polygon(&[
+                            [x, y + h / 2.0],
+                            [x + w / 4.0, y],
+                            [x + 0.75 * w, y],
+                            [x + w, y + h / 2.0],
+                            [x + 0.75 * w, y + h],
+                            [x + w / 4.0, y + h],
+                        ]);
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Copies the pixels of `layer` inside `area`.
@@ -1096,11 +1227,15 @@ mod tests {
 
     #[test]
     fn grid_layout_rounds_down() {
+        let rect = GridKind::Rectangle;
         // 3x7 cells in a 10x20 area -> 3 columns, 2 rows.
-        assert_eq!(grid_layout([0, 0], [3, 7], [10, 20]), ([0, 0], 3, 2));
+        assert_eq!(rect.layout([0, 0], [3, 7], [10, 20]), ([0.0, 0.0], 3, 2));
         // Dragging up/left grows the grid the other way.
-        assert_eq!(grid_layout([0, 0], [3, 7], [-10, -20]), ([-9, -14], 3, 2));
-        assert_eq!(grid_layout([5, 5], [3, 7], [6, 30]), ([5, 5], 0, 3));
+        assert_eq!(
+            rect.layout([0, 0], [3, 7], [-10, -20]),
+            ([-9.0, -14.0], 3, 2)
+        );
+        assert_eq!(rect.layout([5, 5], [3, 7], [6, 30]), ([5.0, 5.0], 0, 3));
     }
 
     #[test]
@@ -1382,5 +1517,48 @@ mod tests {
         assert_eq!(layer.pixel(100, 0), [0; 4]);
         assert_eq!(layer.pixel(9_000, 9_000), [0; 4]);
         assert_eq!(layer.pixel(40, 0)[3], 255, "the outline stays");
+    }
+
+    #[test]
+    fn triangle_and_hexagon_grids_fit_and_draw() {
+        // Triangles 10 wide overlap by half: 7 half-widths fit in 35 -> 6 triangles.
+        assert_eq!(GridKind::Triangle.fit([10, 9], [35, 20]), (6, 2));
+        assert_eq!(GridKind::Triangle.fit([10, 9], [9, 20]), (0, 2));
+        // Hexagons 20 wide step by 15: 20 + 3*15 = 65 <= 70 -> 4 columns,
+        // and the shifted columns need half a cell more height.
+        assert_eq!(GridKind::Hexagon.fit([20, 17], [70, 40]), (4, 1));
+        assert_eq!(GridKind::Hexagon.fit([20, 17], [20, 40]), (1, 2));
+        for kind in GridKind::ALL {
+            let (cols, rows) = kind.fit([12, 10], [100, 80]);
+            let [ew, eh] = kind.extent([12, 10], cols, rows);
+            assert!(ew <= 100.0 && eh <= 80.0, "{kind:?} overflows: {ew}x{eh}");
+        }
+
+        let mut layer = Layer::new(1, "L");
+        let mut op = PaintOp::new(1, paint(RED));
+        let segs = GridKind::Hexagon.segments([0.0, 0.0], [40, 34], 2, 1);
+        assert_eq!(segs.len(), 12);
+        for [a, b] in segs {
+            op.stroke_segment(&mut layer, a, b, 1.0);
+        }
+        assert_eq!(layer.pixel(20, 0), RED, "top edge of the first hexagon");
+        assert_eq!(layer.pixel(20, 17), [0; 4], "inside the first hexagon");
+        assert_eq!(
+            layer.pixel(50, 17),
+            RED,
+            "the second column starts half a cell lower"
+        );
+        assert_eq!(
+            layer.pixel(50, 5),
+            [0; 4],
+            "nothing above the shifted column"
+        );
+    }
+
+    #[test]
+    fn grid_layout_grows_towards_the_drag() {
+        let (tl, cols, rows) = GridKind::Triangle.layout([100, 100], [10, 9], [65, 80]);
+        assert_eq!((cols, rows), (6, 2));
+        assert_eq!(tl, [65.0, 82.0]);
     }
 }

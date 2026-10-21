@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CursorIcon, Key, KeyboardShortcut, Modifiers, PointerButton,
@@ -6,7 +8,10 @@ use eframe::egui::{
     TextureWrapMode, Vec2,
 };
 
-use crate::canvas::{self, IRect, Image, Layer, LayerId, PaintMode, PaintOp, TILE, TileKey};
+use crate::canvas::{
+    self, GridKind, IRect, Image, Layer, LayerId, PaintMode, PaintOp, TILE, TileKey,
+};
+use crate::file;
 use crate::history::{Action, History};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
@@ -68,6 +73,28 @@ enum PreviewKey {
         color: [u8; 4],
         opacity: f32,
     },
+}
+
+/// What a file dialog was opened for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogPurpose {
+    Open,
+    SaveAs,
+}
+
+/// A native file dialog running on a background thread, so the UI never
+/// blocks on it (on Linux it goes through the desktop portal, which may be
+/// slow or missing).
+struct FileDialog {
+    purpose: DialogPurpose,
+    result: std::sync::mpsc::Receiver<Option<PathBuf>>,
+}
+
+/// Something that would discard unsaved changes, waiting for confirmation.
+#[derive(Clone, Debug)]
+enum PendingAction {
+    New,
+    Open(PathBuf),
 }
 
 /// Progress of the click-by-click grid tool.
@@ -218,6 +245,22 @@ pub struct PaintApp {
     text_edit: Option<TextEdit>,
     text_face: FontFace,
     grid: Option<GridState>,
+    grid_kind: GridKind,
+
+    /// Where the image was last opened from / saved to.
+    file_path: Option<PathBuf>,
+    /// History version at the last save or open, to detect unsaved changes.
+    saved_version: u64,
+    pending: Option<PendingAction>,
+    /// Action to run once a save asked for by the confirmation dialog is done.
+    after_save: Option<PendingAction>,
+    dialog: Option<FileDialog>,
+    /// A short notice shown at the bottom of the canvas.
+    message: Option<(String, Instant)>,
+    /// Window title last sent to the OS.
+    title: String,
+    /// Canvas area to bring into view once the canvas size is known.
+    center_on: Option<IRect>,
     /// Last copied image, used if the system clipboard can't be read.
     clipboard: Option<Image>,
 
@@ -288,6 +331,15 @@ impl PaintApp {
             text_edit: None,
             text_face: FontFace::Sans,
             grid: None,
+            grid_kind: GridKind::Rectangle,
+            file_path: None,
+            saved_version: 0,
+            pending: None,
+            after_save: None,
+            dialog: None,
+            message: None,
+            title: String::new(),
+            center_on: None,
             clipboard: None,
             offset: Vec2::ZERO,
             zoom: 1.0,
@@ -319,12 +371,20 @@ impl eframe::App for PaintApp {
             self.commit_text();
         }
         self.shortcuts(&ctx);
+        let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
+        if let Some(path) = dropped {
+            self.request(PendingAction::Open(path));
+        }
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas_area(ui));
         self.brush_window(&ctx);
         self.layers_window(&ctx);
         self.settings_window(&ctx);
+        self.poll_dialog(&ctx);
+        self.confirm_window(&ctx);
+        self.message_popup(&ctx);
+        self.update_title(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -367,6 +427,24 @@ impl PaintApp {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
             return;
+        }
+        let shortcut = |m: Modifiers, k: Key| KeyboardShortcut::new(m, k);
+        let (save_as, save, open, new) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&shortcut(Modifiers::COMMAND | Modifiers::SHIFT, Key::S)),
+                i.consume_shortcut(&shortcut(Modifiers::COMMAND, Key::S)),
+                i.consume_shortcut(&shortcut(Modifiers::COMMAND, Key::O)),
+                i.consume_shortcut(&shortcut(Modifiers::COMMAND, Key::N)),
+            )
+        });
+        if save_as || save {
+            self.save(save_as);
+        }
+        if open {
+            self.open_dialog();
+        }
+        if new {
+            self.request(PendingAction::New);
         }
         if self.text_edit.is_some() {
             // While typing, the keyboard belongs to the text.
@@ -564,14 +642,312 @@ impl PaintApp {
         }
     }
 
+    // ----- Files -----
+
+    fn unsaved(&self) -> bool {
+        self.history.version() != self.saved_version
+    }
+
+    fn notify(&mut self, text: impl Into<String>) {
+        self.message = Some((text.into(), Instant::now()));
+    }
+
+    /// Runs `action` now, or asks first if it would discard unsaved changes.
+    fn request(&mut self, action: PendingAction) {
+        if self.unsaved() {
+            self.pending = Some(action);
+        } else {
+            self.run(action);
+        }
+    }
+
+    fn run(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::New => self.reset_document(),
+            PendingAction::Open(path) => self.open_path(path),
+        }
+    }
+
+    /// Starts over with one empty layer.
+    fn reset_document(&mut self) {
+        self.gesture = None;
+        self.floating = None;
+        self.text_edit = None;
+        self.grid = None;
+        self.selection = None;
+        let id = self.next_layer_id;
+        self.next_layer_id += 1;
+        self.layers = vec![Layer::new(id, "Layer 1")];
+        self.active = 0;
+        self.history = History::new(200);
+        self.saved_version = self.history.version();
+        self.file_path = None;
+        self.offset = Vec2::ZERO;
+        self.zoom = 1.0;
+    }
+
+    /// Opens an image as a new document, its top-left corner at the origin.
+    pub fn open_path(&mut self, path: PathBuf) {
+        let image = match file::load(&path) {
+            Ok(image) => image,
+            Err(e) => {
+                let name = path.file_name().unwrap_or(path.as_os_str());
+                self.notify(format!("Couldn't open {}: {e}", name.to_string_lossy()));
+                return;
+            }
+        };
+        self.reset_document();
+        let layer = &mut self.layers[0];
+        if let Some(name) = path.file_name() {
+            layer.name = name.to_string_lossy().into_owned();
+        }
+        let mode = PaintMode::Paint {
+            color: [0; 4],
+            opacity: 1.0,
+        };
+        PaintOp::new(layer.id, mode).blit(layer, &image, 0, 0);
+        self.center_on = Some(IRect {
+            x0: 0,
+            y0: 0,
+            x1: image.width as i32,
+            y1: image.height as i32,
+        });
+        // Only remember formats we can write back to.
+        self.file_path = file::Format::from_path(&path).map(|_| path);
+    }
+
+    fn open_dialog(&mut self) {
+        let dialog = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp"]);
+        self.show_dialog(DialogPurpose::Open, move || dialog.pick_file());
+    }
+
+    fn show_dialog(
+        &mut self,
+        purpose: DialogPurpose,
+        run: impl FnOnce() -> Option<PathBuf> + Send + 'static,
+    ) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        if cfg!(target_os = "macos") {
+            // macOS only allows dialogs on the main thread; they can't hang there.
+            tx.send(run()).ok();
+        } else {
+            std::thread::spawn(move || tx.send(run()).ok());
+        }
+        self.dialog = Some(FileDialog {
+            purpose,
+            result: rx,
+        });
+    }
+
+    /// Acts on a file dialog's answer once it arrives.
+    fn poll_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &self.dialog else {
+            return;
+        };
+        let answer = match dialog.result.try_recv() {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        let purpose = dialog.purpose;
+        self.dialog = None;
+        match (purpose, answer) {
+            (DialogPurpose::Open, Some(path)) => self.request(PendingAction::Open(path)),
+            (DialogPurpose::SaveAs, Some(path)) => self.save_to(file::with_image_extension(path)),
+            (_, None) => self.after_save = None,
+        }
+    }
+
+    /// The visible layers flattened, cropped to what's drawn.
+    fn export_image(&self) -> Option<Image> {
+        let visible = |id: LayerId| self.layers.iter().any(|l| l.id == id && l.visible);
+        let drawn = self
+            .content_bounds
+            .iter()
+            .filter(|((id, _), _)| visible(*id))
+            .map(|(_, b)| *b)
+            .reduce(|a, b| a.union(&b));
+        // With only a filled background there's no edge; save the view.
+        let area = drawn.or_else(|| {
+            let filled = self.layers.iter().any(|l| l.visible && l.default[3] > 0);
+            filled.then(|| self.visible_canvas_rect(self.canvas_rect))
+        })?;
+        Some(canvas::copy_region_merged(&self.layers, area))
+    }
+
+    /// Saves to the current file, or asks where with `save_as` or for a new image.
+    fn save(&mut self, save_as: bool) {
+        match (&self.file_path, save_as) {
+            (Some(path), false) => self.save_to(path.clone()),
+            _ => {
+                let name = self
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map_or("untitled.png".into(), |n| n.to_string_lossy().into_owned());
+                let mut dialog = rfd::FileDialog::new().set_file_name(name);
+                for (label, extensions) in file::FILTERS {
+                    dialog = dialog.add_filter(label, extensions);
+                }
+                self.show_dialog(DialogPurpose::SaveAs, move || dialog.save_file());
+            }
+        }
+    }
+
+    fn save_to(&mut self, path: PathBuf) {
+        self.commit_text();
+        self.place_floating();
+        let Some(image) = self.export_image() else {
+            self.after_save = None;
+            self.notify("Nothing to save yet: the canvas is empty.");
+            return;
+        };
+        let name = path.file_name().map_or(path.display().to_string(), |n| {
+            n.to_string_lossy().into_owned()
+        });
+        match file::save(&path, &image) {
+            Ok(()) => {
+                self.notify(format!("Saved {name} ({} × {})", image.width, image.height));
+                self.file_path = Some(path);
+                self.saved_version = self.history.version();
+                if let Some(action) = self.after_save.take() {
+                    self.run(action);
+                }
+            }
+            Err(e) => {
+                self.after_save = None;
+                self.notify(format!("Couldn't save {name}: {e}"));
+            }
+        }
+    }
+
+    fn confirm_window(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending.clone() else {
+            return;
+        };
+        let mut choice = None;
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("The image has unsaved changes. Save them first?");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        choice = Some("save");
+                    }
+                    if ui.button("Don't save").clicked() {
+                        choice = Some("discard");
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some("cancel");
+                    }
+                });
+            });
+        match choice {
+            Some("save") => {
+                // Runs the action once saving finishes (possibly after a dialog).
+                self.pending = None;
+                self.after_save = Some(action);
+                self.save(false);
+            }
+            Some("discard") => {
+                self.pending = None;
+                self.run(action);
+            }
+            Some(_) => self.pending = None,
+            None => {}
+        }
+    }
+
+    fn message_popup(&mut self, ctx: &egui::Context) {
+        let Some((text, at)) = &self.message else {
+            return;
+        };
+        const SHOW_FOR: Duration = Duration::from_secs(4);
+        if at.elapsed() > SHOW_FOR {
+            self.message = None;
+            return;
+        }
+        ctx.request_repaint_after(SHOW_FOR - at.elapsed());
+        egui::Window::new("message")
+            .title_bar(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_BOTTOM, [0.0, -16.0])
+            .show(ctx, |ui| ui.label(text.as_str()));
+    }
+
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let name = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map_or("Untitled".into(), |n| n.to_string_lossy().into_owned());
+        let title = format!("{}{name} – Paint", if self.unsaved() { "*" } else { "" });
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("New").on_hover_text("Ctrl+N").clicked() {
+                    self.request(PendingAction::New);
+                    ui.close();
+                }
+                if ui.button("Open…").on_hover_text("Ctrl+O").clicked() {
+                    ui.close();
+                    self.open_dialog();
+                }
+                if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
+                    ui.close();
+                    self.save(false);
+                }
+                if ui
+                    .button("Save As…")
+                    .on_hover_text("Ctrl+Shift+S")
+                    .clicked()
+                {
+                    ui.close();
+                    self.save(true);
+                }
+            });
+            ui.separator();
             for (tool, name, key, icon) in Tool::ALL {
                 if icon_button(ui, icon, self.tool == tool)
                     .on_hover_text(format!("{name} ({})", key.name()))
                     .clicked()
                 {
                     self.tool = tool;
+                }
+            }
+            ui.separator();
+            // Grid shape; picking one also switches to the Grid tool.
+            for kind in GridKind::ALL {
+                let icon = match kind {
+                    GridKind::Rectangle => Icon::Grid,
+                    GridKind::Triangle => Icon::TriangleGrid,
+                    GridKind::Hexagon => Icon::HexagonGrid,
+                };
+                let selected = self.tool == Tool::Grid && self.grid_kind == kind;
+                if icon_button(ui, icon, selected)
+                    .on_hover_text(format!("Grid of {}", kind.label().to_lowercase()))
+                    .clicked()
+                {
+                    if self.grid_kind != kind {
+                        self.grid = None;
+                    }
+                    self.grid_kind = kind;
+                    self.tool = Tool::Grid;
                 }
             }
             ui.separator();
@@ -1006,6 +1382,23 @@ impl PaintApp {
         }
     }
 
+    /// Corner of a grid cell under `p`; with the snap key held the cell
+    /// becomes regular (square, equilateral triangle, regular hexagon).
+    fn cell_end(&self, origin: [i32; 2], p: [f32; 2]) -> [i32; 2] {
+        let end = [p[0].round() as i32, p[1].round() as i32];
+        if !self.square_held() {
+            return end;
+        }
+        let ratio = self.grid_kind.regular_ratio();
+        let (dx, dy) = (end[0] - origin[0], end[1] - origin[1]);
+        let w = (dx.abs() as f32).max(dy.abs() as f32 / ratio);
+        let sign = |v: i32| if v < 0 { -1.0 } else { 1.0 };
+        [
+            origin[0] + (sign(dx) * w).round() as i32,
+            origin[1] + (sign(dy) * w * ratio).round() as i32,
+        ]
+    }
+
     fn square_held(&self) -> bool {
         self.settings.square_modifier.is_held(self.modifiers)
     }
@@ -1035,6 +1428,14 @@ impl PaintApp {
     fn canvas_area(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         self.canvas_rect = rect;
+        if let Some(r) = self.center_on.take() {
+            // Fit an opened image into the view (never above 100%).
+            let view = rect.size() * self.pixels_per_point;
+            let fit = (view.x / r.width() as f32).min(view.y / r.height() as f32) * 0.9;
+            self.zoom = fit.min(1.0);
+            let center = Vec2::new((r.x0 + r.x1) as f32 / 2.0, (r.y0 + r.y1) as f32 / 2.0);
+            self.offset = center - rect.size() / self.scale() / 2.0;
+        }
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         self.canvas_hover = response.hover_pos();
         self.handle_view_input(ui, rect, &response);
@@ -1303,7 +1704,7 @@ impl PaintApp {
                 origin: [p[0].round() as i32, p[1].round() as i32],
             }),
             Some(GridState::Cell { origin }) => {
-                let end = self.rect_end(origin, p);
+                let end = self.cell_end(origin, p);
                 let cell = [(end[0] - origin[0]).abs(), (end[1] - origin[1]).abs()];
                 if cell[0] > 0 && cell[1] > 0 {
                     Some(GridState::Grid { origin, cell })
@@ -1313,19 +1714,22 @@ impl PaintApp {
             }
             Some(GridState::Grid { origin, cell }) => {
                 let end = self.rect_end(origin, p);
-                let (top_left, cols, rows) = canvas::grid_layout(origin, cell, end);
+                let kind = self.grid_kind;
+                let (top_left, cols, rows) = kind.layout(origin, cell, end);
                 if cols == 0 || rows == 0 {
                     return;
                 }
                 let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
-                op.grid(
-                    &mut self.layers[self.active],
-                    top_left,
-                    cell,
-                    cols,
-                    rows,
-                    brush.size,
-                );
+                let layer = &mut self.layers[self.active];
+                if kind == GridKind::Rectangle {
+                    // Pixel-aligned, with square corners.
+                    let tl = [top_left[0] as i32, top_left[1] as i32];
+                    op.grid(layer, tl, cell, cols, rows, brush.size);
+                } else {
+                    for [a, b] in kind.segments(top_left, cell, cols, rows) {
+                        op.stroke_segment(layer, a, b, brush.size / 2.0);
+                    }
+                }
                 self.commit(op);
                 None
             }
@@ -1690,13 +2094,11 @@ impl PaintApp {
             let p = self.to_canvas(rect, pos);
             match grid {
                 GridState::Cell { origin } => {
-                    let r = canvas::rect_from_corners(origin, self.rect_end(origin, p));
-                    painter.rect_stroke(
-                        self.screen_rect_of(rect, r),
-                        0.0,
-                        pen,
-                        egui::StrokeKind::Middle,
-                    );
+                    let r = canvas::rect_from_corners(origin, self.cell_end(origin, p));
+                    let cell = [r.width(), r.height()];
+                    let tl = [r.x0 as f32, r.y0 as f32];
+                    let segments = self.grid_kind.segments(tl, cell, 1, 1);
+                    self.paint_segments(&painter, rect, &segments, pen);
                     info_label(
                         &painter,
                         pos,
@@ -1705,14 +2107,20 @@ impl PaintApp {
                 }
                 GridState::Grid { origin, cell } => {
                     let end = self.rect_end(origin, p);
-                    let (top_left, cols, rows) = canvas::grid_layout(origin, cell, end);
+                    let kind = self.grid_kind;
+                    let (top_left, cols, rows) = kind.layout(origin, cell, end);
                     // The area being dragged out, and the cells that fit in it.
                     marching_ants(
                         &painter,
                         self.screen_rect_of(rect, canvas::rect_from_corners(origin, end)),
                     );
-                    self.paint_grid_preview(&painter, rect, top_left, cell, cols, rows, pen);
-                    info_label(&painter, pos, format!("{cols} × {rows} cells"));
+                    // Huge grids would just be a solid blob on screen; cap the line count.
+                    if cols.saturating_mul(rows) <= 20_000 {
+                        let segments = kind.segments(top_left, cell, cols, rows);
+                        self.paint_segments(&painter, rect, &segments, pen);
+                    }
+                    let what = kind.label().to_lowercase();
+                    info_label(&painter, pos, format!("{cols} × {rows} {what}"));
                 }
             }
         }
@@ -1803,44 +2211,15 @@ impl PaintApp {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn paint_grid_preview(
+    fn paint_segments(
         &self,
         painter: &egui::Painter,
         rect: Rect,
-        top_left: [i32; 2],
-        cell: [i32; 2],
-        cols: i32,
-        rows: i32,
+        segments: &[canvas::Segment],
         pen: Stroke,
     ) {
-        if cols == 0 || rows == 0 {
-            return;
-        }
-        let at = |c: i32, r: i32| {
-            self.to_screen(
-                rect,
-                [
-                    (top_left[0] + c * cell[0]) as f32,
-                    (top_left[1] + r * cell[1]) as f32,
-                ],
-            )
-        };
-        // Huge grids would just be a solid blob on screen; cap the line count.
-        if cols > 500 || rows > 500 {
-            painter.rect_stroke(
-                Rect::from_two_pos(at(0, 0), at(cols, rows)),
-                0.0,
-                pen,
-                egui::StrokeKind::Middle,
-            );
-            return;
-        }
-        for c in 0..=cols {
-            painter.line_segment([at(c, 0), at(c, rows)], pen);
-        }
-        for r in 0..=rows {
-            painter.line_segment([at(0, r), at(cols, r)], pen);
+        for [a, b] in segments {
+            painter.line_segment([self.to_screen(rect, *a), self.to_screen(rect, *b)], pen);
         }
     }
 }
