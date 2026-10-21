@@ -6,10 +6,12 @@
 use crate::canvas::{Layer, LayerId, Rgba, TileKey};
 
 pub enum Action {
-    /// Puts these tiles back into the layer (`None` = tile didn't exist).
+    /// Puts these tiles back into the layer (`None` = tile didn't exist),
+    /// and the layer's default color if it changed.
     Tiles {
         layer_id: LayerId,
         tiles: Vec<(TileKey, Option<Vec<Rgba>>)>,
+        default: Option<Rgba>,
     },
     InsertLayer {
         index: usize,
@@ -28,13 +30,22 @@ impl Action {
     /// Applies the action to `layers` and returns the action that reverts it.
     fn apply(self, layers: &mut Vec<Layer>) -> Option<Action> {
         match self {
-            Action::Tiles { layer_id, tiles } => {
+            Action::Tiles {
+                layer_id,
+                tiles,
+                default,
+            } => {
                 let layer = layers.iter_mut().find(|l| l.id == layer_id)?;
                 let tiles = tiles
                     .into_iter()
                     .map(|(key, tile)| (key, layer.swap_tile(key, tile)))
                     .collect();
-                Some(Action::Tiles { layer_id, tiles })
+                let default = default.map(|d| layer.set_default(d));
+                Some(Action::Tiles {
+                    layer_id,
+                    tiles,
+                    default,
+                })
             }
             Action::InsertLayer { index, mut layer } => {
                 layer.mark_all_dirty();
@@ -129,6 +140,7 @@ mod tests {
         Action::Tiles {
             layer_id: layer.id,
             tiles: op.finish().unwrap(),
+            default: None,
         }
     }
 
@@ -170,6 +182,23 @@ mod tests {
         h.redo(&mut layers);
         h.redo(&mut layers);
         assert_eq!(layers.iter().map(|l| l.id).collect::<Vec<_>>(), [2, 1]);
+    }
+
+    #[test]
+    fn undo_background_fill() {
+        let mut layers = vec![Layer::new(1, "a")];
+        let mut h = History::new(10);
+        let r = crate::canvas::flood_fill(&mut layers[0], 0, 0, 0, [1, 2, 3, 255], 1.0).unwrap();
+        h.push(Action::Tiles {
+            layer_id: 1,
+            tiles: r.tiles,
+            default: r.old_default,
+        });
+        assert_eq!(layers[0].pixel(500, 500), [1, 2, 3, 255]);
+        h.undo(&mut layers);
+        assert_eq!(layers[0].pixel(500, 500), [0; 4]);
+        h.redo(&mut layers);
+        assert_eq!(layers[0].pixel(500, 500), [1, 2, 3, 255]);
     }
 
     #[test]

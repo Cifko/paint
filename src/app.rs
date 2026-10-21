@@ -982,19 +982,16 @@ impl PaintApp {
             }
             Tool::Grid => self.grid_click(p),
             Tool::Fill => {
-                let mut limit = self.visible_canvas_rect(rect);
                 let layer = &mut self.layers[self.active];
-                if let Some(b) = layer.bounds() {
-                    limit = limit.union(&b);
-                }
                 let (x, y) = (p[0].floor() as i32, p[1].floor() as i32);
                 let color = self.color.to_array();
-                if let Some(tiles) =
-                    canvas::flood_fill(layer, x, y, limit, self.fill_tolerance, color, self.opacity)
+                if let Some(fill) =
+                    canvas::flood_fill(layer, x, y, self.fill_tolerance, color, self.opacity)
                 {
                     self.history.push(Action::Tiles {
                         layer_id: layer.id,
-                        tiles,
+                        tiles: fill.tiles,
+                        default: fill.old_default,
                     });
                 }
             }
@@ -1096,7 +1093,11 @@ impl PaintApp {
     fn commit(&mut self, op: PaintOp) {
         let layer_id = op.layer_id;
         if let Some(tiles) = op.finish() {
-            self.history.push(Action::Tiles { layer_id, tiles });
+            self.history.push(Action::Tiles {
+                layer_id,
+                tiles,
+                default: None,
+            });
         }
     }
 
@@ -1106,6 +1107,9 @@ impl PaintApp {
     /// and refreshes layer thumbnails.
     fn sync_textures(&mut self, ctx: &egui::Context) {
         for layer in &mut self.layers {
+            if std::mem::take(&mut layer.default_changed) {
+                self.thumbs_dirty = true;
+            }
             for key in layer.dirty.drain() {
                 let tex_key = (layer.id, key);
                 self.thumbs_dirty = true;
@@ -1228,7 +1232,7 @@ impl PaintApp {
         for layer in &self.layers {
             let pixels = match region {
                 Some(r) => canvas::thumbnail(layer, r, THUMB),
-                None => vec![[0; 4]; THUMB * THUMB],
+                None => vec![layer.default; THUMB * THUMB],
             };
             let image = ColorImage::from_rgba_unmultiplied([THUMB, THUMB], pixels.as_flattened());
             match self.thumbs.get_mut(&layer.id) {
@@ -1255,6 +1259,7 @@ impl PaintApp {
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         for (index, layer) in self.layers.iter().enumerate() {
             if layer.visible && layer.opacity > 0.0 {
+                self.paint_layer_default(&painter, rect, layer, (tx0, ty0, tx1, ty1));
                 let tint = Color32::from_white_alpha((layer.opacity * 255.0).round() as u8);
                 for &key in layer.tiles.keys() {
                     if key.0 < tx0 || key.0 > tx1 || key.1 < ty0 || key.1 > ty1 {
@@ -1411,6 +1416,46 @@ impl PaintApp {
 }
 
 impl PaintApp {
+    /// Paints a layer's default color everywhere in view that has no tile;
+    /// tiles carry their own pixels. Gaps are merged into one rectangle per
+    /// run of missing tiles in each tile row.
+    fn paint_layer_default(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        layer: &Layer,
+        (tx0, ty0, tx1, ty1): (i32, i32, i32, i32),
+    ) {
+        if layer.default[3] == 0 {
+            return;
+        }
+        let [r, g, b, a] = layer.default;
+        let color = Color32::from_rgba_unmultiplied(r, g, b, a).gamma_multiply(layer.opacity);
+        let mut rows: HashMap<i32, Vec<i32>> = HashMap::new();
+        for &(tx, ty) in layer.tiles.keys() {
+            if (tx0..=tx1).contains(&tx) && (ty0..=ty1).contains(&ty) {
+                rows.entry(ty).or_default().push(tx);
+            }
+        }
+        for ty in ty0..=ty1 {
+            let mut present = rows.remove(&ty).unwrap_or_default();
+            present.sort_unstable();
+            let mut start = tx0;
+            for tx in present.into_iter().chain([tx1 + 1]) {
+                if tx > start {
+                    let gap = IRect {
+                        x0: start * TILE,
+                        y0: ty * TILE,
+                        x1: tx * TILE,
+                        y1: (ty + 1) * TILE,
+                    };
+                    painter.rect_filled(self.screen_rect_of(rect, gap), 0.0, color);
+                }
+                start = tx + 1;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint_grid_preview(
         &self,
