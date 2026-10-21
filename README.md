@@ -58,9 +58,10 @@ size slider sets the font size; the font is chosen in the side panel (DejaVu fon
 bundled).
 
 Shapes and grids: hover the shape (or grid) button to pick a kind from its menu.
-Rectangle, ellipse, triangle and n-gon: drag from corner to corner of the bounding box.
-The n-gon is always regular (3–20 sides, set with the Sides slider), fitted into the box
-with a flat bottom edge. Line: drag from end to end.
+Rectangle, ellipse and triangle: drag from corner to corner of the bounding box.
+N-gon (regular, 3–20 sides set with the Sides slider): click where vertex 0 goes, then
+move and click again where vertex n/2 (rounded down) goes – or drag between the two.
+The polygon turns and scales live with the mouse; `Shift` snaps the turn to 15° steps. Line: drag from end to end.
 Polyline: click to add points, double-click or `Enter` to finish, click the first point
 to close it; `Ctrl+Z` removes the last point, `Esc` cancels. The pen size is the line
 width.

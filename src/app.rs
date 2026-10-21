@@ -152,6 +152,11 @@ enum Gesture {
     Line {
         start: [f32; 2],
     },
+    /// Placing an n-gon: `start` is vertex 0, `press` where the mouse went down.
+    NGon {
+        start: [f32; 2],
+        press: Pos2,
+    },
     Select {
         start: [i32; 2],
     },
@@ -283,6 +288,8 @@ pub struct PaintApp {
     shape_kind: ShapeKind,
     /// Number of sides of the n-gon shape.
     ngon_sides: u32,
+    /// Vertex 0 of an n-gon waiting for the click that places its far vertex.
+    ngon_start: Option<[f32; 2]>,
     polyline: Option<Polyline>,
 
     /// Where the image was last opened from / saved to.
@@ -372,6 +379,7 @@ impl PaintApp {
             grid_kind: GridKind::Rectangle,
             shape_kind: ShapeKind::Rectangle,
             ngon_sides: 6,
+            ngon_start: None,
             polyline: None,
             file_path: None,
             saved_version: 0,
@@ -413,6 +421,9 @@ impl eframe::App for PaintApp {
         }
         if self.tool != Tool::Shape || self.shape_kind != ShapeKind::Polyline {
             self.finish_polyline();
+        }
+        if self.tool != Tool::Shape || self.shape_kind != ShapeKind::NGon {
+            self.ngon_start = None;
         }
         self.shortcuts(&ctx);
         let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
@@ -559,6 +570,7 @@ impl PaintApp {
         if escape
             && self.grid.take().is_none()
             && self.polyline.take().is_none()
+            && self.ngon_start.take().is_none()
             && self.floating.take().is_none()
         {
             self.selection = None;
@@ -1186,7 +1198,7 @@ impl PaintApp {
                         ui.label("Tolerance");
                         ui.add(egui::DragValue::new(&mut self.fill_tolerance).range(0..=255));
                     }
-                    Tool::Shape if self.shape_kind.is_boxed() => {
+                    Tool::Shape if self.shape_kind.can_fill() => {
                         ui.separator();
                         ui.checkbox(&mut self.fill_shapes, "Filled");
                     }
@@ -1496,7 +1508,7 @@ impl PaintApp {
     /// Corner of a rectangle, ellipse or triangle's box; with the snap key
     /// held it becomes a square, circle or equilateral triangle.
     fn shape_end(&self, origin: [i32; 2], p: [f32; 2]) -> [i32; 2] {
-        self.regular_end(origin, p, self.shape_kind.regular_ratio(self.ngon_sides))
+        self.regular_end(origin, p, self.shape_kind.regular_ratio())
     }
 
     /// The pixel corner under `p`; with the snap key held, moved so the box
@@ -1520,10 +1532,28 @@ impl PaintApp {
         if r.width() <= 0 || r.height() <= 0 {
             return Vec::new();
         }
-        match self.shape_kind {
-            ShapeKind::NGon => canvas::ngon_points(r, self.ngon_sides),
-            _ => canvas::triangle_points(r).to_vec(),
+        canvas::triangle_points(r).to_vec()
+    }
+
+    /// Where an n-gon's far vertex goes for pointer `p`; the snap key turns
+    /// it in 15° steps around vertex 0.
+    fn ngon_end(&self, v0: [f32; 2], p: [f32; 2]) -> [f32; 2] {
+        if self.square_held() {
+            canvas::snap_rotation(v0, p, 15.0)
+        } else {
+            p
         }
+    }
+
+    fn commit_ngon(&mut self, v0: [f32; 2], vk: [f32; 2]) {
+        let pts = canvas::ngon_from_vertices(v0, vk, self.ngon_sides);
+        if pts.is_empty() {
+            return;
+        }
+        let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
+        let (size, filled) = (self.paint_brush.size, self.fill_shapes);
+        op.polygon(&mut self.layers[self.active], &pts, size, filled);
+        self.commit(op);
     }
 
     /// End of a line from `start`, snapped to 45° steps with the snap key.
@@ -1698,7 +1728,10 @@ impl PaintApp {
                             // Like MS Paint: the right button paints with color 2.
                             // Shapes built from several clicks (polyline, grid) keep
                             // the color of their first click.
-                            if self.polyline.is_none() && self.grid.is_none() {
+                            if self.polyline.is_none()
+                                && self.grid.is_none()
+                                && self.ngon_start.is_none()
+                            {
                                 self.use_secondary = button == PointerButton::Secondary;
                             }
                             self.gesture_button = button;
@@ -1855,6 +1888,17 @@ impl PaintApp {
                     self.gesture = Some(Gesture::Line { start });
                 }
                 ShapeKind::Polyline => self.polyline_click(rect, p),
+                // Vertex 0 here, the far vertex on release after a drag or on
+                // the next click.
+                ShapeKind::NGon => match self.ngon_start.take() {
+                    Some(v0) => self.commit_ngon(v0, self.ngon_end(v0, p)),
+                    None => {
+                        self.gesture = Some(Gesture::NGon {
+                            start: p,
+                            press: pos,
+                        })
+                    }
+                },
                 _ => {
                     let start = [p[0].round() as i32, p[1].round() as i32];
                     self.gesture = Some(Gesture::Shape { start });
@@ -1954,14 +1998,20 @@ impl PaintApp {
                     ShapeKind::Rectangle => op.rectangle(layer, r, brush.size, self.fill_shapes),
                     ShapeKind::Ellipse => op.ellipse(layer, r, brush.size, self.fill_shapes),
                     _ => {
-                        let pts = match self.shape_kind {
-                            ShapeKind::NGon => canvas::ngon_points(r, self.ngon_sides),
-                            _ => canvas::triangle_points(r).to_vec(),
-                        };
+                        let pts = canvas::triangle_points(r);
                         op.polygon(layer, &pts, brush.size, self.fill_shapes);
                     }
                 }
                 self.commit(op);
+            }
+            Some(Gesture::NGon { start, press }) => {
+                let Some(pos) = pos else { return };
+                if press.distance(pos) >= 5.0 {
+                    self.commit_ngon(start, self.ngon_end(start, self.to_canvas(rect, pos)));
+                } else {
+                    // Just a click: wait for the second one.
+                    self.ngon_start = Some(start);
+                }
             }
             Some(Gesture::Line { start }) => {
                 let Some(pos) = pos else { return };
@@ -2075,6 +2125,11 @@ impl PaintApp {
         }
     }
 
+    fn ngon_preview(&self, v0: [f32; 2], p: [f32; 2]) -> PreviewKey {
+        let pts = canvas::ngon_from_vertices(v0, self.ngon_end(v0, p), self.ngon_sides);
+        self.shape_preview(ShapeSpec::Polygon(pts, self.brush().size, self.fill_shapes))
+    }
+
     fn shape_preview(&self, shape: ShapeSpec) -> PreviewKey {
         PreviewKey::Shape {
             shape,
@@ -2105,6 +2160,13 @@ impl PaintApp {
                 let end = self.line_end(*start, self.to_canvas(rect, pos));
                 let shape = ShapeSpec::Polyline(vec![*start, end], self.brush().size);
                 Some(self.shape_preview(shape))
+            }
+            (Some(Gesture::NGon { start, .. }), Some(pos), _) => {
+                Some(self.ngon_preview(*start, self.to_canvas(rect, pos)))
+            }
+            (None, Some(pos), _) if self.ngon_start.is_some() => {
+                let start = self.ngon_start.expect("checked above");
+                Some(self.ngon_preview(start, self.to_canvas(rect, pos)))
             }
             (None, pointer, _) if self.polyline.is_some() => {
                 let poly = self.polyline.as_ref().expect("checked above");
@@ -2278,6 +2340,13 @@ impl PaintApp {
                 }
                 Some(Gesture::Line { start }) => {
                     info_label(&painter, pos, line_info(*start, self.line_end(*start, p)));
+                }
+                Some(Gesture::NGon { start, .. }) => {
+                    info_label(&painter, pos, line_info(*start, self.ngon_end(*start, p)));
+                }
+                None if self.ngon_start.is_some() => {
+                    let start = self.ngon_start.expect("checked above");
+                    info_label(&painter, pos, line_info(start, self.ngon_end(start, p)));
                 }
                 None if self.polyline.is_some() => {
                     let poly = self.polyline.as_ref().expect("checked above");
@@ -2502,9 +2571,8 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool) -> egui::Response 
 }
 
 /// A list of kinds (shapes, grid shapes) for a tool button. It opens while
-/// the pointer is over the button or the small arrow next to it (or when the
-/// arrow is clicked, for touch screens) and stays open while the pointer is
-/// over the list. Returns the kind picked.
+/// the pointer is over the button and stays open while the pointer is over
+/// the list. Returns the kind picked.
 fn hover_menu<K: Copy + PartialEq>(
     ui: &mut egui::Ui,
     button: &egui::Response,
@@ -2514,32 +2582,15 @@ fn hover_menu<K: Copy + PartialEq>(
     icon: fn(K) -> Icon,
     label: fn(K) -> &'static str,
 ) -> Option<K> {
-    let (arrow_rect, arrow) = ui.allocate_exact_size(Vec2::new(12.0, 28.0), Sense::click());
-    let color = if arrow.hovered() || button.hovered() {
-        ui.visuals().strong_text_color()
-    } else {
-        ui.visuals().text_color()
-    };
-    let c = arrow_rect.center();
-    ui.painter().add(Shape::convex_polygon(
-        vec![
-            c + Vec2::new(-4.0, -2.0),
-            c + Vec2::new(4.0, -2.0),
-            c + Vec2::new(0.0, 3.0),
-        ],
-        color,
-        Stroke::NONE,
-    ));
-
     let ctx = ui.ctx().clone();
     let id = button.id.with("hover_menu");
     let rect_id = id.with("rect");
     let mut open = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
     let menu_rect = ctx.data(|d| d.get_temp::<Rect>(rect_id));
-    let anchor = button.rect.union(arrow_rect);
+    let anchor = button.rect;
     let pointer = ctx.input(|i| i.pointer.hover_pos());
     let over = |r: Rect| pointer.is_some_and(|p| r.expand(4.0).contains(p));
-    if button.hovered() || arrow.hovered() || arrow.clicked() {
+    if button.hovered() {
         open = true;
     } else if !over(anchor) && !(open && menu_rect.is_some_and(over)) {
         open = false;
@@ -2611,8 +2662,9 @@ fn pixel_center(p: [f32; 2]) -> [f32; 2] {
 fn line_info(a: [f32; 2], b: [f32; 2]) -> String {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     // Angles count counter-clockwise from the right, as on paper.
-    let angle = (-dy).atan2(dx).to_degrees().rem_euclid(360.0);
-    format!("{:.0} px, {:.0}°", dx.hypot(dy), angle)
+    // Round first so 359.6° shows as 0°, and `+ 0.0` turns -0 into 0.
+    let angle = (-dy).atan2(dx).to_degrees().round().rem_euclid(360.0) + 0.0;
+    format!("{:.0} px, {angle:.0}°", dx.hypot(dy))
 }
 
 fn grid_icon(kind: GridKind) -> Icon {
