@@ -2,6 +2,8 @@
 
 mod app;
 mod canvas;
+#[cfg(target_os = "linux")]
+mod desktop;
 mod file;
 mod floating;
 mod history;
@@ -10,14 +12,20 @@ mod settings;
 mod shortcuts;
 mod text;
 
+/// Names the window for the desktop: Wayland's app id and X11's WM_CLASS.
+const APP_ID: &str = "paint";
+
 fn main() -> eframe::Result {
+    #[cfg(target_os = "linux")]
+    desktop::install();
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Paint")
-            .with_app_id("paint")
+            .with_app_id(APP_ID)
             .with_inner_size([1280.0, 800.0])
             .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/256.png"))
                     .expect("bundled icon is a valid PNG"),
             ),
         ..Default::default()

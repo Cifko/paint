@@ -116,6 +116,22 @@ On Linux you may need the usual windowing libraries, e.g. on Debian/Ubuntu:
 sudo apt install libxkbcommon-x11-0 libx11-6 libxcursor1 libxrandr2 libxi6 libwayland-client0
 ```
 
+### App icon
+
+- **Windows:** the icon is embedded in `paint.exe` at build time.
+- **Linux:** docks and taskbars (GNOME, KDE, …) take the icon from a desktop
+  entry, not from the window. On startup Paint installs
+  `~/.local/share/applications/paint.desktop` and its icons under
+  `~/.local/share/icons/hicolor/`, pointing at the executable you ran. The
+  entry is refreshed when the binary moves, and an existing `paint.desktop`
+  that Paint didn't write is left alone. If the very first launch still shows a
+  generic icon, the next launch will have it. Paint then also appears in the
+  app launcher and in "Open with" for PNG, JPEG and BMP files.
+- **macOS:** the running app sets its Dock icon. To build a proper `Paint.app`
+  with the icon (for `/Applications` or Finder), run `scripts/bundle-macos.sh`
+  on a Mac; it writes `target/Paint.app`. CI builds the same bundle and
+  attaches it to each macOS run as the `Paint-macos` artifact.
+
 ## Development
 
 ```sh
