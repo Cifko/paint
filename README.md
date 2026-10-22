@@ -29,6 +29,11 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
   the key and behavior are configurable in **Settings**.
 - **Layers** – previews, add, delete, reorder, hide, rename, per-layer opacity.
 - **Undo / redo** for painting and layer add/delete/reorder.
+- **Compact window** – the toolbar with the File / Edit / View menus *is* the title bar,
+  like in VS Code: drag its empty space to move the window, double-click to maximize,
+  and use its minimize / maximize / close buttons and the window edges on Windows and
+  Linux. On macOS the traffic lights sit over its left end. Prefer the system title
+  bar? **Settings → Window** (Windows and Linux).
 
 ## Controls
 
@@ -152,3 +157,6 @@ Code layout:
 - `src/text.rs` – text tool fonts, layout and editing.
 - `src/shortcuts.rs` – rebindable keyboard shortcuts.
 - `src/settings.rs` – user preferences (saved between runs).
+- `src/titlebar.rs` – the toolbar as the window's title bar (moving, resizing, window
+  buttons).
+- `src/desktop.rs` – Linux desktop entry and icons.

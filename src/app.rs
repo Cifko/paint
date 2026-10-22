@@ -15,8 +15,9 @@ use crate::floating::{Floating, Frame, Handle};
 use crate::history::{Action, History};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
-use crate::shortcuts::Action as Command;
+use crate::shortcuts::{Action as Command, Shortcut};
 use crate::text::{self, FontFace, TextStyle};
+use crate::titlebar;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
@@ -298,6 +299,12 @@ pub struct PaintApp {
     content_bounds: HashMap<(LayerId, TileKey), IRect>,
     thumbs_dirty: bool,
     thumbs_updated_at: f64,
+    /// The window decorations last requested (custom title bar off = shown).
+    decorations: Option<bool>,
+    /// Where the toolbar ends; the layers window sits just below it.
+    toolbar_bottom: f32,
+    /// The window edges resize the window (no system borders).
+    window_edges: bool,
 }
 
 impl PaintApp {
@@ -369,6 +376,9 @@ impl PaintApp {
             content_bounds: HashMap::new(),
             thumbs_dirty: true,
             thumbs_updated_at: 0.0,
+            decorations: None,
+            toolbar_bottom: 40.0,
+            window_edges: false,
         }
     }
 }
@@ -395,7 +405,17 @@ impl eframe::App for PaintApp {
             self.request(PendingAction::Open(path));
         }
 
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        let custom_title_bar = !self.settings.system_title_bar || !titlebar::DRAWS_CONTROLS;
+        if titlebar::DRAWS_CONTROLS && self.decorations != Some(!custom_title_bar) {
+            self.decorations = Some(!custom_title_bar);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!custom_title_bar));
+        }
+        self.window_edges = custom_title_bar && titlebar::DRAWS_CONTROLS;
+        let title = self.title.clone();
+        let toolbar = egui::Panel::top("toolbar").show(ui, |ui| {
+            titlebar::show(ui, custom_title_bar, &title, |ui| self.toolbar(ui));
+        });
+        self.toolbar_bottom = toolbar.response.rect.bottom();
         egui::CentralPanel::no_frame().show(ui, |ui| self.canvas_area(ui));
         self.brush_window(&ctx);
         self.layers_window(&ctx);
@@ -405,6 +425,9 @@ impl eframe::App for PaintApp {
         self.confirm_window(&ctx);
         self.message_popup(&ctx);
         self.update_title(&ctx);
+        if self.window_edges {
+            titlebar::resize_edges(&ctx);
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -994,37 +1017,9 @@ impl PaintApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         // Wraps onto a second row when the window is too narrow.
         ui.horizontal_wrapped(|ui| {
-            ui.menu_button("File", |ui| {
-                // Tooltips are computed up front: the actions below need `self`.
-                let tip = |a: Command| {
-                    self.settings
-                        .binding(a)
-                        .map_or(String::new(), |s| s.label())
-                };
-                let [tip_new, tip_open, tip_save, tip_save_as] =
-                    [Command::New, Command::Open, Command::Save, Command::SaveAs].map(tip);
-                if ui.button("New").on_hover_text(tip_new).clicked() {
-                    self.request(PendingAction::New);
-                    ui.close();
-                }
-                if ui.button("Open…").on_hover_text(tip_open).clicked() {
-                    ui.close();
-                    self.open_dialog();
-                }
-                if ui.button("Save").on_hover_text(tip_save).clicked() {
-                    ui.close();
-                    self.save(false);
-                }
-                if ui.button("Save As…").on_hover_text(tip_save_as).clicked() {
-                    ui.close();
-                    self.save(true);
-                }
-                ui.separator();
-                if ui.button("Settings…").clicked() {
-                    ui.close();
-                    self.settings_open = true;
-                }
-            });
+            self.file_menu(ui);
+            self.edit_menu(ui);
+            self.view_menu(ui);
             ui.separator();
             for (tool, name, key, icon) in Tool::ALL {
                 // The grid and shape buttons show the chosen kind.
@@ -1128,29 +1123,6 @@ impl PaintApp {
             }
             ui.separator();
 
-            let can_copy = self.active_selection().is_some() || self.floating.is_some();
-            if ui
-                .add_enabled(can_copy, egui::Button::new("Copy"))
-                .on_hover_text("Copy from the active layer (Ctrl+C)")
-                .clicked()
-            {
-                self.copy(ui.ctx(), false);
-            }
-            if ui
-                .add_enabled(can_copy, egui::Button::new("Copy merged"))
-                .on_hover_text(
-                    self.settings
-                        .with_shortcut("Copy what's visible on all layers", Command::CopyMerged),
-                )
-                .clicked()
-            {
-                self.copy(ui.ctx(), true);
-            }
-            if ui.button("Paste").on_hover_text("Ctrl+V").clicked() {
-                self.paste_from_clipboard();
-            }
-            ui.separator();
-
             ui.label(format!("{:.0}%", self.zoom * 100.0));
             if ui
                 .button("Fit")
@@ -1162,19 +1134,96 @@ impl PaintApp {
             {
                 self.fit_to_window();
             }
-            if ui
-                .button("Reset view")
-                .on_hover_text(self.settings.with_shortcut(
-                    "Back to the origin at 100% (1 image pixel = 1 screen pixel)",
-                    Command::ResetView,
-                ))
-                .clicked()
-            {
-                self.reset_view();
+        });
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        let shortcut = |a: Command| {
+            self.settings
+                .binding(a)
+                .map_or(String::new(), |s| s.label())
+        };
+        let [new, open, save, save_as] =
+            [Command::New, Command::Open, Command::Save, Command::SaveAs].map(shortcut);
+        ui.menu_button("File", |ui| {
+            if menu_item(ui, true, "New", &new) {
+                self.request(PendingAction::New);
+            }
+            if menu_item(ui, true, "Open…", &open) {
+                self.open_dialog();
+            }
+            if menu_item(ui, true, "Save", &save) {
+                self.save(false);
+            }
+            if menu_item(ui, true, "Save As…", &save_as) {
+                self.save(true);
             }
             ui.separator();
-            if ui.button("Settings").clicked() {
-                self.settings_open = !self.settings_open;
+            if menu_item(ui, true, "Settings…", "") {
+                self.settings_open = true;
+            }
+        });
+    }
+
+    /// Clipboard and selection actions.
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        let can_copy = self.active_selection().is_some() || self.floating.is_some();
+        let shortcut = |a: Command| {
+            self.settings
+                .binding(a)
+                .map_or(String::new(), |s| s.label())
+        };
+        let [undo, redo, select_all, copy_merged] = [
+            Command::Undo,
+            Command::Redo,
+            Command::SelectAll,
+            Command::CopyMerged,
+        ]
+        .map(shortcut);
+        let (can_undo, can_redo) = (self.history.can_undo(), self.history.can_redo());
+        ui.menu_button("Edit", |ui| {
+            if menu_item(ui, can_undo, "Undo", &undo) {
+                self.undo();
+            }
+            if menu_item(ui, can_redo, "Redo", &redo) {
+                self.redo();
+            }
+            ui.separator();
+            if menu_item(
+                ui,
+                can_copy,
+                "Copy",
+                &Shortcut::command(egui::Key::C).label(),
+            ) {
+                self.copy(ui.ctx(), false);
+            }
+            if menu_item(ui, can_copy, "Copy merged", &copy_merged) {
+                self.copy(ui.ctx(), true);
+            }
+            if menu_item(ui, true, "Paste", &Shortcut::command(egui::Key::V).label()) {
+                self.paste_from_clipboard();
+            }
+            ui.separator();
+            if menu_item(ui, true, "Select all", &select_all) {
+                self.select_all();
+            }
+        });
+    }
+
+    /// Zoom and panning.
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        let shortcut = |a: Command| {
+            self.settings
+                .binding(a)
+                .map_or(String::new(), |s| s.label())
+        };
+        let [fit, reset] = [Command::FitToWindow, Command::ResetView].map(shortcut);
+        ui.menu_button("View", |ui| {
+            if menu_item(ui, true, "Fit to window", &fit) {
+                self.fit_to_window();
+            }
+            if menu_item(ui, true, "Reset view (100%)", &reset) {
+                self.reset_view();
             }
         });
     }
@@ -1350,7 +1399,7 @@ impl PaintApp {
         let layers = egui::Window::new("Layers")
             .resizable(false)
             .collapsible(true)
-            .anchor(Align2::RIGHT_TOP, [-10.0, 40.0])
+            .anchor(Align2::RIGHT_TOP, [-10.0, self.toolbar_bottom + 8.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("+").on_hover_text("New layer").clicked() {
@@ -1969,8 +2018,9 @@ impl PaintApp {
                     pressed: true,
                     modifiers,
                 } => {
-                    let on_canvas =
-                        rect.contains(pos) && ctx.layer_id_at(pos) == Some(ui.layer_id());
+                    let on_canvas = rect.contains(pos)
+                        && ctx.layer_id_at(pos) == Some(ui.layer_id())
+                        && !(self.window_edges && titlebar::edge_at(ctx, pos).is_some());
                     if self.gesture.is_some() || !on_canvas {
                         continue;
                     }
@@ -2876,6 +2926,17 @@ fn info_label(painter: &egui::Painter, pointer: Pos2, text: String) {
 }
 
 /// A square toolbar button showing an icon.
+/// A menu entry showing its shortcut; closes the menu when clicked.
+fn menu_item(ui: &mut egui::Ui, enabled: bool, label: &str, shortcut: &str) -> bool {
+    let clicked = ui
+        .add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut))
+        .clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+
 fn icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
     let visuals = ui.visuals();

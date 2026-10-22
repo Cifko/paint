@@ -11,6 +11,7 @@ mod icons;
 mod settings;
 mod shortcuts;
 mod text;
+mod titlebar;
 
 /// Names the window for the desktop: Wayland's app id and X11's WM_CLASS.
 const APP_ID: &str = "paint";
@@ -20,7 +21,7 @@ fn main() -> eframe::Result {
     desktop::install();
 
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
+        viewport: titlebar::configure(eframe::egui::ViewportBuilder::default())
             .with_title("Paint")
             .with_app_id(APP_ID)
             .with_inner_size([1280.0, 800.0])
