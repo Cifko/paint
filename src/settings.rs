@@ -96,6 +96,9 @@ pub struct Settings {
     #[serde(alias = "paste_white_transparent")]
     pub paste_secondary_transparent: bool,
     pub tool_defaults: ToolDefaults,
+    /// Use the desktop's own title bar instead of putting the toolbar there
+    /// (Windows and Linux; macOS always merges them).
+    pub system_title_bar: bool,
     /// Shortcuts changed from their defaults (`None` = no shortcut).
     pub shortcuts: BTreeMap<Action, Option<Shortcut>>,
     /// The action waiting for a key press in the settings window.
@@ -113,6 +116,7 @@ impl Default for Settings {
             square_modifier: ModifierKey::Shift,
             paste_secondary_transparent: true,
             tool_defaults: ToolDefaults::default(),
+            system_title_bar: false,
             shortcuts: BTreeMap::new(),
             capturing: None,
         }
@@ -248,6 +252,26 @@ impl Settings {
                             );
                         }
                     });
+                if crate::titlebar::DRAWS_CONTROLS {
+                    egui::CollapsingHeader::new("Window")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("window_settings")
+                                .num_columns(3)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Use the system title bar");
+                                    ui.checkbox(&mut self.system_title_bar, "");
+                                    reset(
+                                        ui,
+                                        &mut self.system_title_bar,
+                                        defaults.system_title_bar,
+                                    );
+                                    ui.end_row();
+                                });
+                            ui.small("Off: the toolbar is the title bar, saving vertical space.");
+                        });
+                }
             });
         ui.separator();
         if ui.button("Restore all defaults").clicked() {
