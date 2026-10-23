@@ -10,6 +10,7 @@ use eframe::egui::{
 use crate::canvas::{
     self, GridKind, IRect, Image, Layer, LayerId, PaintMode, PaintOp, ShapeKind, TILE, TileKey,
 };
+use crate::color_picker;
 use crate::file;
 use crate::floating::{Floating, Frame, Handle};
 use crate::history::{Action, History};
@@ -309,6 +310,9 @@ pub struct PaintApp {
     layers_widths: (Option<f32>, Option<f32>),
     /// Width of the expanded layers window's contents.
     layers_inner_width: Option<f32>,
+    /// Height of the visible part of the layer list, and the most it may take.
+    layers_list_height: f32,
+    layers_list_max_height: f32,
 }
 
 impl PaintApp {
@@ -385,6 +389,8 @@ impl PaintApp {
             window_edges: false,
             layers_widths: (None, None),
             layers_inner_width: None,
+            layers_list_height: 0.0,
+            layers_list_max_height: f32::INFINITY,
         }
     }
 }
@@ -698,6 +704,7 @@ impl PaintApp {
             std::mem::swap(&mut self.primary, &mut self.secondary);
         }
 
+        let mode = &mut self.settings.color_mode;
         for (resp, color) in [
             (front_resp, &mut self.primary),
             (back_resp, &mut self.secondary),
@@ -709,11 +716,7 @@ impl PaintApp {
                     if *color == Color32::TRANSPARENT {
                         *color = Color32::WHITE;
                     }
-                    egui::color_picker::color_picker_color32(
-                        ui,
-                        color,
-                        egui::color_picker::Alpha::Opaque,
-                    );
+                    color_picker::show(ui, color, mode);
                 });
         }
     }
@@ -1422,7 +1425,14 @@ impl PaintApp {
         // Until the window has been collapsed once, estimate that width from
         // its title bar: collapse button, gap, title and margins.
         let collapsed = collapsed.unwrap_or_else(|| collapsed_window_width(ctx, "Layers"));
-        let mut window = egui::Window::new("Layers").id(id);
+        // The window stays over the canvas, keeping its margin from the
+        // toolbar and the bottom; the layer list scrolls to make it fit.
+        let margin = 8.0;
+        let area = Rect::from_min_max(
+            Pos2::new(ctx.content_rect().left(), self.toolbar_bottom),
+            ctx.content_rect().max,
+        );
+        let mut window = egui::Window::new("Layers").id(id).constrain_to(area);
         let mut animating = false;
         if openness > 0.0
             && openness < 1.0
@@ -1435,7 +1445,7 @@ impl PaintApp {
         let layers = window
             .resizable(false)
             .collapsible(true)
-            .anchor(Align2::RIGHT_TOP, [-10.0, self.toolbar_bottom + 8.0])
+            .anchor(Align2::RIGHT_TOP, [-10.0, margin])
             .show(ctx, |ui| {
                 let Some(full_width) = animating.then_some(self.layers_inner_width).flatten()
                 else {
@@ -1466,6 +1476,11 @@ impl PaintApp {
                 );
             });
         if let Some(r) = &layers {
+            if openness == 1.0 {
+                // Everything but the list, which is what has to fit around it.
+                let rest = r.response.rect.height() - self.layers_list_height;
+                self.layers_list_max_height = (area.height() - 2.0 * margin - rest).max(48.0);
+            }
             match openness {
                 0.0 => self.layers_widths.0 = Some(r.response.rect.width()),
                 1.0 => self.layers_widths.1 = Some(r.response.rect.width()),
@@ -1507,21 +1522,26 @@ impl PaintApp {
         });
         ui.separator();
 
-        // Topmost layer first.
-        for i in (0..self.layers.len()).rev() {
-            ui.horizontal(|ui| {
-                let layer = &mut self.layers[i];
-                ui.checkbox(&mut layer.visible, "").on_hover_text("Visible");
-                let thumb = self.thumbs.get(&layer.id).map(|t| t.id());
-                let clicked_thumb = layer_thumbnail(ui, thumb, i == self.active).clicked();
-                let clicked_name = ui
-                    .selectable_label(i == self.active, layer.name.as_str())
-                    .clicked();
-                if clicked_thumb || clicked_name {
-                    self.active = i;
+        // Topmost layer first; scrolls when the window would leave the canvas.
+        let list = egui::ScrollArea::vertical()
+            .max_height(self.layers_list_max_height)
+            .show(ui, |ui| {
+                for i in (0..self.layers.len()).rev() {
+                    ui.horizontal(|ui| {
+                        let layer = &mut self.layers[i];
+                        ui.checkbox(&mut layer.visible, "").on_hover_text("Visible");
+                        let thumb = self.thumbs.get(&layer.id).map(|t| t.id());
+                        let clicked_thumb = layer_thumbnail(ui, thumb, i == self.active).clicked();
+                        let clicked_name = ui
+                            .selectable_label(i == self.active, layer.name.as_str())
+                            .clicked();
+                        if clicked_thumb || clicked_name {
+                            self.active = i;
+                        }
+                    });
                 }
             });
-        }
+        self.layers_list_height = list.inner_rect.height();
         ui.separator();
 
         let layer = &mut self.layers[self.active];

@@ -21,13 +21,14 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
   Color 2 (white by default) is treated as transparent when pasting (toggleable).
 - **Two colors, like MS Paint** – the left mouse button paints with color 1, the right
   button with color 2. Left-click a palette swatch to set color 1, right-click to set
-  color 2; click either color in the toolbar for a full picker, `X` swaps them. The last
+  color 2; click either color in the toolbar for a picker (with RGB, HSV or hex values), `X` swaps them. The last
   swatch is **Clear**: with it, Fill (and Brush, shapes, Text) erase instead of painting.
 - **Floating size and opacity sliders** on the left side of the canvas. Painting tools
   share one size/opacity; the eraser and the text tool each keep their own.
 - **Quick brush resize** – hold Alt (Option on macOS) and drag left/right or scroll;
   the key and behavior are configurable in **Settings**.
-- **Layers** – previews, add, delete, reorder, hide, rename, per-layer opacity.
+- **Layers** – previews, add, delete, reorder, hide, rename, per-layer opacity. The
+  layers window always stays over the canvas; a long list scrolls.
 - **Undo / redo** for painting and layer add/delete/reorder.
 - **Compact window** – the toolbar with the File / Edit / View menus *is* the title bar,
   like in VS Code: drag its empty space to move the window, double-click to maximize,
@@ -154,6 +155,7 @@ Code layout:
 - `src/history.rs` – undo/redo.
 - `src/floating.rs` – pasted / lifted pieces and their transform handles.
 - `src/file.rs` – loading and saving images.
+- `src/color_picker.rs` – the color picker.
 - `src/text.rs` – text tool fonts, layout and editing.
 - `src/shortcuts.rs` – rebindable keyboard shortcuts.
 - `src/settings.rs` – user preferences (saved between runs).

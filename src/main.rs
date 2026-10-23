@@ -2,6 +2,7 @@
 
 mod app;
 mod canvas;
+mod color_picker;
 #[cfg(target_os = "linux")]
 mod desktop;
 mod file;
