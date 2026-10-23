@@ -53,6 +53,7 @@ button, plus "Restore all defaults".
 | Zoom | Mouse wheel / pinch (around the cursor) |
 | Brush / Eraser / Fill | `B` / `E` / `G` |
 | Shape tool / Grid / Select / Text | `S` / `H` / `M` / `T` |
+| Next shape / grid type (press the tool's key again) | `S` / `H` |
 | Rectangle / Ellipse / N-gon / Line / Polyline | `R` / `C` / `N` / `L` / `P` |
 | Snap to square / circle / equilateral triangle, lines to 45° steps | Hold `Shift` while drawing (configurable) |
 | Select everything that's painted | `Ctrl+A` |
