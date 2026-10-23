@@ -1,5 +1,5 @@
 //! A floating piece – a pasted image or a lifted selection – that can be
-//! moved, rotated, skewed and mirrored before it's placed onto a layer.
+//! moved, rotated, scaled, skewed and mirrored before it's placed onto a layer.
 
 use eframe::egui::TextureHandle;
 
@@ -16,7 +16,13 @@ pub enum Handle {
     SkewBottom,
     SkewLeft,
     SkewRight,
+    /// A corner, by index into [`Frame::corners`]: scales with the opposite
+    /// corner fixed.
+    Scale(usize),
 }
+
+/// Local directions of the corners, in [`Frame::corners`] order.
+const CORNER_SIGNS: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
 
 /// Screen distance of the rotate handle beyond the top edge.
 const ROTATE_HANDLE_OFFSET: f32 = 28.0;
@@ -30,7 +36,7 @@ pub struct Floating {
     pub transparent: Option<[u8; 3]>,
     /// Pasted images can key out a color; lifted selections keep theirs.
     pub keyable: bool,
-    /// Rotation, skew and mirroring applied around the center.
+    /// Rotation, scale, skew and mirroring applied around the center.
     pub matrix: Matrix,
     /// What will be placed: `keyed` transformed by `matrix`.
     pub image: Image,
@@ -156,7 +162,7 @@ impl Frame {
     /// Corners, clockwise from the top-left.
     pub fn corners(&self) -> [[f32; 2]; 4] {
         let [w, h] = [self.size[0] / 2.0, self.size[1] / 2.0];
-        [[-w, -h], [w, -h], [w, h], [-w, h]].map(|c| self.point(c))
+        CORNER_SIGNS.map(|[sx, sy]| self.point([sx * w, sy * h]))
     }
 
     pub fn contains(&self, p: [f32; 2]) -> bool {
@@ -169,7 +175,7 @@ impl Frame {
 
     /// Where each handle is, in canvas coordinates. `scale` is screen points
     /// per canvas pixel, so the rotate handle keeps its distance on screen.
-    pub fn handles(&self, scale: f32) -> [(Handle, [f32; 2]); 5] {
+    pub fn handles(&self, scale: f32) -> [(Handle, [f32; 2]); 9] {
         let [w, h] = [self.size[0] / 2.0, self.size[1] / 2.0];
         let top = self.point([0.0, -h]);
         let (dx, dy) = (top[0] - self.center[0], top[1] - self.center[1]);
@@ -180,6 +186,7 @@ impl Frame {
             [0.0, -1.0]
         };
         let off = ROTATE_HANDLE_OFFSET / scale;
+        let corners = self.corners();
         [
             (
                 Handle::Rotate,
@@ -189,13 +196,60 @@ impl Frame {
             (Handle::SkewBottom, self.point([0.0, h])),
             (Handle::SkewLeft, self.point([-w, 0.0])),
             (Handle::SkewRight, self.point([w, 0.0])),
+            (Handle::Scale(0), corners[0]),
+            (Handle::Scale(1), corners[1]),
+            (Handle::Scale(2), corners[2]),
+            (Handle::Scale(3), corners[3]),
         ]
     }
 
-    /// The transform after dragging `handle` from `start` to `now` (canvas
-    /// points), starting from `self.matrix`. With `snap`, rotation moves in
-    /// 15° steps.
-    pub fn drag(&self, handle: Handle, start: [f32; 2], now: [f32; 2], snap: bool) -> Matrix {
+    /// The transform and center after dragging `handle` from `start` to
+    /// `now` (canvas points), starting from this frame. With `snap`, rotation
+    /// moves in 15° steps and scaling keeps the proportions.
+    pub fn drag(
+        &self,
+        handle: Handle,
+        start: [f32; 2],
+        now: [f32; 2],
+        snap: bool,
+    ) -> (Matrix, [f32; 2]) {
+        if let Handle::Scale(corner) = handle {
+            return self.scale_corner(corner, now, snap);
+        }
+        (self.drag_matrix(handle, start, now, snap), self.center)
+    }
+
+    /// Scales so corner `corner` follows `now` while the opposite corner stays.
+    fn scale_corner(&self, corner: usize, now: [f32; 2], keep_aspect: bool) -> (Matrix, [f32; 2]) {
+        let m0 = self.matrix;
+        let Some(inv) = canvas::mat_inverse(m0) else {
+            return (m0, self.center);
+        };
+        let [sx, sy] = CORNER_SIGNS[corner];
+        let [w, h] = [self.size[0].max(1.0) / 2.0, self.size[1].max(1.0) / 2.0];
+        let opposite_local = [-sx * w, -sy * h];
+        let fixed = self.point(opposite_local);
+        // The dragged corner relative to the fixed one, in the box's own axes.
+        let d = canvas::mat_apply(inv, [now[0] - fixed[0], now[1] - fixed[1]]);
+        let span = [2.0 * sx * w, 2.0 * sy * h];
+        let (mut kx, mut ky) = (d[0] / span[0], d[1] / span[1]);
+        if keep_aspect {
+            // Project onto the diagonal: one factor for both axes.
+            let k = (d[0] * span[0] + d[1] * span[1]) / (span[0] * span[0] + span[1] * span[1]);
+            (kx, ky) = (k, k);
+        }
+        // Keep at least a pixel; dragging past the fixed corner mirrors.
+        let at_least = |k: f32, side: f32| {
+            let min = 1.0 / side;
+            if k.abs() < min { min.copysign(k) } else { k }
+        };
+        let (kx, ky) = (at_least(kx, 2.0 * w), at_least(ky, 2.0 * h));
+        let m = canvas::mat_mul(m0, [kx, 0.0, 0.0, ky]);
+        let v = canvas::mat_apply(m, opposite_local);
+        (m, [fixed[0] - v[0], fixed[1] - v[1]])
+    }
+
+    fn drag_matrix(&self, handle: Handle, start: [f32; 2], now: [f32; 2], snap: bool) -> Matrix {
         let m0 = self.matrix;
         let c = self.center;
         let (dx, dy) = (now[0] - start[0], now[1] - start[1]);
@@ -228,6 +282,7 @@ impl Frame {
                 };
                 canvas::mat_mul(m0, [1.0, 0.0, sign * along / w, 1.0])
             }
+            Handle::Scale(_) => unreachable!("handled in drag"),
         }
     }
 }
@@ -250,11 +305,11 @@ mod tests {
         let f = frame();
         let start = f.handles(1.0)[0].1;
         // Drag the handle (above the center) to the right of the center: 90°.
-        let m = f.drag(Handle::Rotate, start, [150.0, 25.0], false);
+        let (m, _) = f.drag(Handle::Rotate, start, [150.0, 25.0], false);
         let r = canvas::rotation(std::f32::consts::FRAC_PI_2);
         assert!(m.iter().zip(r).all(|(a, b)| (a - b).abs() < 1e-4), "{m:?}");
         // Snapping rounds a ~5° turn to the nearest 15° step: none.
-        let m = f.drag(Handle::Rotate, [50.0, -100.0], [60.0, -100.0], true);
+        let (m, _) = f.drag(Handle::Rotate, [50.0, -100.0], [60.0, -100.0], true);
         assert!(
             m.iter().zip(IDENTITY).all(|(a, b)| (a - b).abs() < 1e-4),
             "{m:?}"
@@ -265,7 +320,7 @@ mod tests {
     fn skew_handles_follow_the_pointer() {
         let f = frame();
         let top = f.handles(1.0)[1].1;
-        let m = f.drag(Handle::SkewTop, top, [top[0] + 20.0, top[1]], false);
+        let (m, _) = f.drag(Handle::SkewTop, top, [top[0] + 20.0, top[1]], false);
         let moved = Frame { matrix: m, ..f };
         let new_top = moved.handles(1.0)[1].1;
         assert!((new_top[0] - (top[0] + 20.0)).abs() < 1e-3, "{new_top:?}");
@@ -273,9 +328,45 @@ mod tests {
         let bottom = moved.handles(1.0)[2].1;
         assert!((bottom[0] - 30.0).abs() < 1e-3, "{bottom:?}");
         let right = f.handles(1.0)[4].1;
-        let m = f.drag(Handle::SkewRight, right, [right[0], right[1] + 10.0], false);
+        let (m, _) = f.drag(Handle::SkewRight, right, [right[0], right[1] + 10.0], false);
         let moved = Frame { matrix: m, ..f };
         assert!((moved.handles(1.0)[4].1[1] - (right[1] + 10.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn corners_scale_with_the_opposite_corner_fixed() {
+        let f = frame();
+        // Drag the bottom-right corner from (100, 50) to (200, 75).
+        let (m, center) = f.drag(Handle::Scale(2), [100.0, 50.0], [200.0, 75.0], false);
+        let scaled = Frame {
+            matrix: m,
+            center,
+            ..f
+        };
+        let c = scaled.corners();
+        assert!((c[0][0]).abs() < 1e-3 && (c[0][1]).abs() < 1e-3, "{c:?}");
+        assert!(
+            (c[2][0] - 200.0).abs() < 1e-3 && (c[2][1] - 75.0).abs() < 1e-3,
+            "{c:?}"
+        );
+        // Keeping the aspect ratio scales both axes by the same factor.
+        let (m, _) = f.drag(Handle::Scale(2), [100.0, 50.0], [200.0, 60.0], true);
+        assert!(
+            (m[0] - m[3]).abs() < 1e-4 && m[1] == 0.0 && m[2] == 0.0,
+            "{m:?}"
+        );
+        // The top-left corner works the same way, around the bottom-right.
+        let (m, center) = f.drag(Handle::Scale(0), [0.0, 0.0], [50.0, 25.0], false);
+        let c = Frame {
+            matrix: m,
+            center,
+            ..f
+        }
+        .corners();
+        assert!(
+            (c[0][0] - 50.0).abs() < 1e-3 && (c[2][0] - 100.0).abs() < 1e-3,
+            "{c:?}"
+        );
     }
 
     #[test]
