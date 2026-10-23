@@ -1,0 +1,63 @@
+# Takes the Windows screenshot for the README: opens docs/screenshots/demo.png
+# in a release build, maximized, and commits the capture back to the branch.
+name: Screenshots
+
+on:
+  push:
+    paths:
+      - .github/workflows/screenshots.yml
+      - docs/screenshots/demo.png
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Take the screenshot
+        shell: pwsh
+        run: |
+          # Match the Ubuntu screenshot's size where the runner allows it.
+          try { Set-DisplayResolution -Width 1280 -Height 800 -Force } catch { Write-Host "Keeping the default resolution: $_" }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Win {
+              [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
+              [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+          }
+          "@
+          $app = Start-Process target/release/paint.exe -ArgumentList "docs/screenshots/demo.png" -PassThru
+          Start-Sleep -Seconds 10
+          $app.Refresh()
+          if ($app.HasExited) { throw "Paint exited with code $($app.ExitCode)" }
+          [Win]::ShowWindow($app.MainWindowHandle, 3) | Out-Null  # SW_MAXIMIZE
+          [Win]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
+          [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(5000, 5000)
+          Start-Sleep -Seconds 4
+          $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          Write-Host "Screen: $($screen.Width)x$($screen.Height)"
+          $bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+          $bitmap.Save("docs/screenshots/windows.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          Stop-Process -Id $app.Id
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-screenshot
+          path: docs/screenshots/windows.png
+      - name: Commit the screenshot
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add docs/screenshots/windows.png
+          git commit -m "Update the Windows screenshot" || exit 0
+          git push origin HEAD:${GITHUB_REF_NAME}
