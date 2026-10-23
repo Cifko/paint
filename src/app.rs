@@ -305,6 +305,10 @@ pub struct PaintApp {
     toolbar_bottom: f32,
     /// The window edges resize the window (no system borders).
     window_edges: bool,
+    /// The layers window's width collapsed and expanded, for animating between them.
+    layers_widths: (Option<f32>, Option<f32>),
+    /// Width of the expanded layers window's contents.
+    layers_inner_width: Option<f32>,
 }
 
 impl PaintApp {
@@ -379,6 +383,8 @@ impl PaintApp {
             decorations: None,
             toolbar_bottom: 40.0,
             window_edges: false,
+            layers_widths: (None, None),
+            layers_inner_width: None,
         }
     }
 }
@@ -1407,70 +1413,126 @@ impl PaintApp {
     }
 
     fn layers_window(&mut self, ctx: &egui::Context) {
-        let layers = egui::Window::new("Layers")
+        // Collapsing animates the height; animate the width alongside it,
+        // between the collapsed (title only) and expanded widths.
+        let id = egui::Id::unique("layers_window");
+        let openness = egui::collapsing_header::CollapsingState::load(ctx, id.with("collapsing"))
+            .map_or(1.0, |state| state.openness(ctx));
+        let (collapsed, expanded) = self.layers_widths;
+        // Until the window has been collapsed once, estimate that width from
+        // its title bar: collapse button, gap, title and margins.
+        let collapsed = collapsed.unwrap_or_else(|| collapsed_window_width(ctx, "Layers"));
+        let mut window = egui::Window::new("Layers").id(id);
+        let mut animating = false;
+        if openness > 0.0
+            && openness < 1.0
+            && let Some(expanded) = expanded
+        {
+            let width = egui::lerp(collapsed..=expanded, openness);
+            window = window.min_width(width).max_width(width);
+            animating = true;
+        }
+        let layers = window
             .resizable(false)
             .collapsible(true)
             .anchor(Align2::RIGHT_TOP, [-10.0, self.toolbar_bottom + 8.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("+").on_hover_text("New layer").clicked() {
-                        self.add_layer();
+                let Some(full_width) = animating.then_some(self.layers_inner_width).flatten()
+                else {
+                    self.layers_contents(ui);
+                    if openness == 1.0 {
+                        self.layers_inner_width = Some(ui.min_rect().width());
                     }
-                    if ui
-                        .add_enabled(self.layers.len() > 1, egui::Button::new("−"))
-                        .on_hover_text("Delete layer")
-                        .clicked()
-                    {
-                        self.history
-                            .perform(Action::RemoveLayer { index: self.active }, &mut self.layers);
-                        self.clamp_active();
-                    }
-                    let top = self.layers.len() - 1;
-                    if ui
-                        .add_enabled(self.active < top, egui::Button::new("⬆"))
-                        .on_hover_text("Move up")
-                        .clicked()
-                    {
-                        self.move_layer(self.active + 1);
-                    }
-                    if ui
-                        .add_enabled(self.active > 0, egui::Button::new("⬇"))
-                        .on_hover_text("Move down")
-                        .clicked()
-                    {
-                        self.move_layer(self.active - 1);
-                    }
-                });
-                ui.separator();
-
-                // Topmost layer first.
-                for i in (0..self.layers.len()).rev() {
-                    ui.horizontal(|ui| {
-                        let layer = &mut self.layers[i];
-                        ui.checkbox(&mut layer.visible, "").on_hover_text("Visible");
-                        let thumb = self.thumbs.get(&layer.id).map(|t| t.id());
-                        let clicked_thumb = layer_thumbnail(ui, thumb, i == self.active).clicked();
-                        let clicked_name = ui
-                            .selectable_label(i == self.active, layer.name.as_str())
-                            .clicked();
-                        if clicked_thumb || clicked_name {
-                            self.active = i;
-                        }
-                    });
-                }
-                ui.separator();
-
-                let layer = &mut self.layers[self.active];
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    ui.add(egui::TextEdit::singleline(&mut layer.name).desired_width(120.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Opacity");
-                    ui.add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0));
-                });
+                    return;
+                };
+                // Mid-animation the window is narrower than its contents: lay
+                // them out at full width and show only what fits.
+                let origin = ui.cursor().min;
+                let visible =
+                    Rect::from_min_size(origin, Vec2::new(ui.available_width(), f32::INFINITY));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(Rect::from_min_size(
+                            origin,
+                            Vec2::new(full_width, f32::INFINITY),
+                        ))
+                        .layout(*ui.layout()),
+                );
+                child.set_clip_rect(ui.clip_rect().intersect(visible));
+                self.layers_contents(&mut child);
+                ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), child.min_rect().height()),
+                    Sense::hover(),
+                );
             });
+        if let Some(r) = &layers {
+            match openness {
+                0.0 => self.layers_widths.0 = Some(r.response.rect.width()),
+                1.0 => self.layers_widths.1 = Some(r.response.rect.width()),
+                _ => {}
+            }
+        }
         self.panel_rects[1] = layers.map(|r| r.response.rect);
+    }
+
+    fn layers_contents(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("+").on_hover_text("New layer").clicked() {
+                self.add_layer();
+            }
+            if ui
+                .add_enabled(self.layers.len() > 1, egui::Button::new("−"))
+                .on_hover_text("Delete layer")
+                .clicked()
+            {
+                self.history
+                    .perform(Action::RemoveLayer { index: self.active }, &mut self.layers);
+                self.clamp_active();
+            }
+            let top = self.layers.len() - 1;
+            if ui
+                .add_enabled(self.active < top, egui::Button::new("⬆"))
+                .on_hover_text("Move up")
+                .clicked()
+            {
+                self.move_layer(self.active + 1);
+            }
+            if ui
+                .add_enabled(self.active > 0, egui::Button::new("⬇"))
+                .on_hover_text("Move down")
+                .clicked()
+            {
+                self.move_layer(self.active - 1);
+            }
+        });
+        ui.separator();
+
+        // Topmost layer first.
+        for i in (0..self.layers.len()).rev() {
+            ui.horizontal(|ui| {
+                let layer = &mut self.layers[i];
+                ui.checkbox(&mut layer.visible, "").on_hover_text("Visible");
+                let thumb = self.thumbs.get(&layer.id).map(|t| t.id());
+                let clicked_thumb = layer_thumbnail(ui, thumb, i == self.active).clicked();
+                let clicked_name = ui
+                    .selectable_label(i == self.active, layer.name.as_str())
+                    .clicked();
+                if clicked_thumb || clicked_name {
+                    self.active = i;
+                }
+            });
+        }
+        ui.separator();
+
+        let layer = &mut self.layers[self.active];
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.add(egui::TextEdit::singleline(&mut layer.name).desired_width(120.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Opacity");
+            ui.add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0));
+        });
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -2937,6 +2999,18 @@ fn info_label(painter: &egui::Painter, pointer: Pos2, text: String) {
 }
 
 /// A square toolbar button showing an icon.
+/// The width of a collapsed window with this title, as egui lays it out.
+fn collapsed_window_width(ctx: &egui::Context, title: &str) -> f32 {
+    let style = ctx.global_style();
+    let font = egui::TextStyle::Heading.resolve(&style);
+    let (text, button) = ctx.fonts_mut(|f| {
+        let text = f.layout_no_wrap(title.to_owned(), font.clone(), Color32::WHITE);
+        (text.size().x, f.row_height(&font))
+    });
+    let frame = egui::Frame::window(&style);
+    button + style.spacing.item_spacing.x + text + frame.total_margin().sum().x
+}
+
 /// A menu entry showing its shortcut; closes the menu when clicked.
 fn menu_item(ui: &mut egui::Ui, enabled: bool, label: &str, shortcut: &str) -> bool {
     let clicked = ui
