@@ -1020,11 +1020,46 @@ impl PaintApp {
         widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
         widgets.inactive.bg_stroke = Stroke::NONE;
         widgets.hovered.bg_stroke = Stroke::NONE;
+        // Text buttons as tall as the tool icons, so everything lines up.
+        ui.spacing_mut().interact_size.y = 28.0;
         // Wraps onto a second row when the window is too narrow.
         ui.horizontal_wrapped(|ui| {
             self.file_menu(ui);
             self.edit_menu(ui);
             self.view_menu(ui);
+            ui.separator();
+
+            if ui
+                .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
+                .on_hover_text(self.settings.with_shortcut("Undo", Command::Undo))
+                .clicked()
+            {
+                self.undo();
+            }
+            if ui
+                .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
+                .on_hover_text(self.settings.with_shortcut("Redo", Command::Redo))
+                .clicked()
+            {
+                self.redo();
+            }
+            ui.separator();
+
+            if ui
+                .button("Fit")
+                .on_hover_text(self.settings.with_shortcut(
+                    "Fit everything drawn into the window (up to 100%)",
+                    Command::FitToWindow,
+                ))
+                .clicked()
+            {
+                self.fit_to_window();
+            }
+            // Fixed width so the tools don't shift as the zoom changes.
+            ui.add_sized(
+                [44.0, 28.0],
+                egui::Label::new(format!("{:.0}%", self.zoom * 100.0)),
+            );
             ui.separator();
             for (tool, name, key, icon) in Tool::ALL {
                 // The grid and shape buttons show the chosen kind.
@@ -1109,35 +1144,6 @@ impl PaintApp {
                 if resp.secondary_clicked() {
                     self.secondary = c;
                 }
-            }
-            ui.separator();
-
-            if ui
-                .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
-                .on_hover_text(self.settings.with_shortcut("Undo", Command::Undo))
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
-                .on_hover_text(self.settings.with_shortcut("Redo", Command::Redo))
-                .clicked()
-            {
-                self.redo();
-            }
-            ui.separator();
-
-            ui.label(format!("{:.0}%", self.zoom * 100.0));
-            if ui
-                .button("Fit")
-                .on_hover_text(self.settings.with_shortcut(
-                    "Fit everything drawn into the window (up to 100%)",
-                    Command::FitToWindow,
-                ))
-                .clicked()
-            {
-                self.fit_to_window();
             }
         });
     }
