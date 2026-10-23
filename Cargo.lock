@@ -2354,6 +2354,7 @@ dependencies = [
  "dejavu",
  "eframe",
  "image",
+ "pollster 1.0.1",
  "rfd",
  "ron",
  "serde",
