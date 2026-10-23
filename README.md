@@ -19,7 +19,7 @@
   pixel with the screen, also on displays with OS scaling (e.g. 150% on Windows), so a
   pasted screenshot comes out exactly its real size.
 - **Tools.** Brush, Eraser, Flood fill, Shapes (rectangle, ellipse, triangle, regular
-  n-gon, line and polyline; outlined or filled), Grid (rectangles, triangles or
+  n-gon, line, arrow and polyline; outlined or filled), Grid (rectangles, triangles or
   hexagons), rectangle Select and Text.
 - **Two colors, like MS Paint.** The left mouse button paints with color 1, the right
   one with color 2. The last palette swatch, **Clear**, makes Fill, Brush, shapes and
@@ -81,7 +81,7 @@ shortcuts**: click it and press the new keys. On macOS, `Ctrl` is `Cmd` and `Alt
 | Brush / Eraser / Fill | `B` / `E` / `G` |
 | Shape / Grid / Select / Text | `S` / `H` / `M` / `T` |
 | Next shape or grid kind | Press `S` / `H` again |
-| Rectangle / Ellipse / N-gon / Line / Polyline | `R` / `C` / `N` / `L` / `P` |
+| Rectangle / Ellipse / N-gon / Line / Arrow / Polyline | `R` / `C` / `N` / `L` / `A` / `P` |
 | Square, circle, regular shape; lines in 45° steps | Hold `Shift` while drawing |
 | Change the brush size | Hold `Alt` and drag left/right or scroll |
 | Swap color 1 and 2 | `X` |
@@ -104,7 +104,7 @@ values.
 
 **Shapes.** Hover the shape button and pick a kind from its menu, or press `S` to
 step through them. Drag from corner to corner for a rectangle, ellipse or triangle,
-or from end to end for a line. The side panel switches between outlined and filled.
+or from end to end for a line or an arrow (the arrow points where you let go). The side panel switches between outlined and filled.
 - **N-gon:** set the number of sides (3–20) in the side panel. Click where the first
   vertex goes, then click where the vertex halfway around goes (vertex n/2, rounded
   down). The polygon turns with the mouse, and `Shift` snaps the turn to 15° steps.
