@@ -99,6 +99,8 @@ pub struct Settings {
     /// Use the desktop's own title bar instead of putting the toolbar there
     /// (Windows and Linux; macOS always merges them).
     pub system_title_bar: bool,
+    /// How the color picker shows the numbers.
+    pub color_mode: crate::color_picker::ColorMode,
     /// Shortcuts changed from their defaults (`None` = no shortcut).
     pub shortcuts: BTreeMap<Action, Option<Shortcut>>,
     /// The action waiting for a key press in the settings window.
@@ -117,6 +119,7 @@ impl Default for Settings {
             paste_secondary_transparent: true,
             tool_defaults: ToolDefaults::default(),
             system_title_bar: false,
+            color_mode: Default::default(),
             shortcuts: BTreeMap::new(),
             capturing: None,
         }
