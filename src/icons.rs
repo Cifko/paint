@@ -12,6 +12,7 @@ pub enum Icon {
     Triangle,
     NGon,
     Line,
+    Arrow,
     Polyline,
     Grid,
     TriangleGrid,
@@ -114,6 +115,11 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Line => {
             painter.line_segment([p(0.16, 0.84), p(0.84, 0.16)], thin);
+        }
+        Icon::Arrow => {
+            let tip = p(0.84, 0.16);
+            painter.line_segment([p(0.16, 0.84), tip], thin);
+            painter.add(Shape::line(vec![p(0.46, 0.16), tip, p(0.84, 0.54)], thin));
         }
         Icon::Polyline => {
             let pts = [p(0.12, 0.78), p(0.36, 0.3), p(0.62, 0.66), p(0.88, 0.2)];

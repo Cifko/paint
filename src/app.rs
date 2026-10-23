@@ -97,11 +97,12 @@ enum PendingAction {
 }
 
 /// Shortcuts that pick a shape (and the Shape tool).
-const SHAPE_ACTIONS: [(Command, ShapeKind); 5] = [
+const SHAPE_ACTIONS: [(Command, ShapeKind); 6] = [
     (Command::ShapeRectangle, ShapeKind::Rectangle),
     (Command::ShapeEllipse, ShapeKind::Ellipse),
     (Command::ShapeNGon, ShapeKind::NGon),
     (Command::ShapeLine, ShapeKind::Line),
+    (Command::ShapeArrow, ShapeKind::Arrow),
     (Command::ShapePolyline, ShapeKind::Polyline),
 ];
 
@@ -1977,6 +1978,15 @@ impl PaintApp {
         }
     }
 
+    /// What a line gesture draws: the line itself, or an arrow.
+    fn line_path(&self, start: [f32; 2], end: [f32; 2]) -> Vec<[f32; 2]> {
+        if self.shape_kind == ShapeKind::Arrow {
+            canvas::arrow_path(start, end, self.brush().size)
+        } else {
+            vec![start, end]
+        }
+    }
+
     /// Adds a polyline point; clicking the last point again (a double click)
     /// finishes it, clicking the first point closes it.
     fn polyline_click(&mut self, rect: Rect, p: [f32; 2]) {
@@ -2331,7 +2341,7 @@ impl PaintApp {
                 self.gesture = Some(Gesture::Stroke { op, last: p });
             }
             Tool::Shape => match self.shape_kind {
-                ShapeKind::Line => {
+                ShapeKind::Line | ShapeKind::Arrow => {
                     let start = pixel_center(p);
                     self.gesture = Some(Gesture::Line { start });
                 }
@@ -2464,8 +2474,9 @@ impl PaintApp {
             Some(Gesture::Line { start }) => {
                 let Some(pos) = pos else { return };
                 let end = self.line_end(start, self.to_canvas(rect, pos));
+                let path = self.line_path(start, end);
                 let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
-                op.polyline(&mut self.layers[self.active], &[start, end], brush.size);
+                op.polyline(&mut self.layers[self.active], &path, brush.size);
                 self.commit(op);
             }
             Some(Gesture::Select { .. }) => {
@@ -2611,7 +2622,7 @@ impl PaintApp {
             }
             (Some(Gesture::Line { start }), Some(pos), _) => {
                 let end = self.line_end(*start, self.to_canvas(rect, pos));
-                let shape = ShapeSpec::Polyline(vec![*start, end], self.brush().size);
+                let shape = ShapeSpec::Polyline(self.line_path(*start, end), self.brush().size);
                 Some(self.shape_preview(shape))
             }
             (Some(Gesture::NGon { start, .. }), Some(pos), _) => {
@@ -3160,6 +3171,7 @@ fn shape_icon(kind: ShapeKind) -> Icon {
         ShapeKind::Triangle => Icon::Triangle,
         ShapeKind::NGon => Icon::NGon,
         ShapeKind::Line => Icon::Line,
+        ShapeKind::Arrow => Icon::Arrow,
         ShapeKind::Polyline => Icon::Polyline,
     }
 }

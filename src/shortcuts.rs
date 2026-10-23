@@ -17,6 +17,7 @@ pub enum Action {
     ShapeEllipse,
     ShapeNGon,
     ShapeLine,
+    ShapeArrow,
     ShapePolyline,
     Undo,
     Redo,
@@ -34,7 +35,7 @@ pub enum Action {
 
 impl Action {
     /// All actions with the group and name shown in the settings.
-    pub const ALL: [(Action, &'static str, &'static str); 24] = [
+    pub const ALL: [(Action, &'static str, &'static str); 25] = [
         (Self::ToolBrush, "Tools", "Brush"),
         (Self::ToolEraser, "Tools", "Eraser"),
         (Self::ToolFill, "Tools", "Fill"),
@@ -46,6 +47,7 @@ impl Action {
         (Self::ShapeEllipse, "Shapes", "Ellipse"),
         (Self::ShapeNGon, "Shapes", "N-gon"),
         (Self::ShapeLine, "Shapes", "Line"),
+        (Self::ShapeArrow, "Shapes", "Arrow"),
         (Self::ShapePolyline, "Shapes", "Polyline"),
         (Self::Undo, "Edit", "Undo"),
         (Self::Redo, "Edit", "Redo"),
@@ -75,6 +77,7 @@ impl Action {
             Self::ShapeEllipse => Shortcut::key(C),
             Self::ShapeNGon => Shortcut::key(N),
             Self::ShapeLine => Shortcut::key(L),
+            Self::ShapeArrow => Shortcut::key(A),
             Self::ShapePolyline => Shortcut::key(P),
             Self::Undo => Shortcut::command(Z),
             Self::Redo => Shortcut::command_shift(Z),

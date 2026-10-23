@@ -535,6 +535,26 @@ pub fn rect_from_corners(a: [i32; 2], b: [i32; 2]) -> IRect {
     }
 }
 
+/// The stroke path of an arrow from `tail` to `tip` drawn `width` wide:
+/// the shaft, then each barb of the open head and back to the tip. The head
+/// grows with the width but stays under half the arrow's length.
+pub fn arrow_path(tail: [f32; 2], tip: [f32; 2], width: f32) -> Vec<[f32; 2]> {
+    let (dx, dy) = (tip[0] - tail[0], tip[1] - tail[1]);
+    let len = dx.hypot(dy);
+    if len < 1e-3 {
+        return vec![tail, tip];
+    }
+    let head = (12.0 + 3.0 * width).min(len * 0.45);
+    let (ux, uy) = (dx / len, dy / len);
+    let (sin, cos) = 30f32.to_radians().sin_cos();
+    let barb = |side: f32| {
+        // The shaft direction turned back by 180° ± 30°.
+        let (bx, by) = (-(ux * cos - side * uy * sin), -(side * ux * sin + uy * cos));
+        [tip[0] + bx * head, tip[1] + by * head]
+    };
+    vec![tail, tip, barb(1.0), tip, barb(-1.0)]
+}
+
 /// What the Shape tool draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeKind {
@@ -544,16 +564,19 @@ pub enum ShapeKind {
     /// A regular polygon with a chosen number of sides.
     NGon,
     Line,
+    /// A line with an open (V-shaped) head at its end.
+    Arrow,
     Polyline,
 }
 
 impl ShapeKind {
-    pub const ALL: [ShapeKind; 6] = [
+    pub const ALL: [ShapeKind; 7] = [
         Self::Rectangle,
         Self::Ellipse,
         Self::Triangle,
         Self::NGon,
         Self::Line,
+        Self::Arrow,
         Self::Polyline,
     ];
 
@@ -564,6 +587,7 @@ impl ShapeKind {
             Self::Triangle => "Triangle",
             Self::NGon => "N-gon",
             Self::Line => "Line",
+            Self::Arrow => "Arrow",
             Self::Polyline => "Polyline",
         }
     }
@@ -1301,6 +1325,26 @@ pub fn flood_fill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_head_points_back_from_the_tip() {
+        let path = arrow_path([0.0, 0.0], [100.0, 0.0], 4.0);
+        assert_eq!(path.len(), 5);
+        assert_eq!(
+            (path[0], path[1], path[3]),
+            ([0.0, 0.0], [100.0, 0.0], [100.0, 0.0])
+        );
+        // A 24 px head (12 + 3 × width) at 30° to the shaft, one barb each side.
+        let (sin, cos) = 30f32.to_radians().sin_cos();
+        for barb in [path[2], path[4]] {
+            assert!((barb[0] - (100.0 - 24.0 * cos)).abs() < 1e-3, "{barb:?}");
+            assert!((barb[1].abs() - 24.0 * sin).abs() < 1e-3, "{barb:?}");
+        }
+        assert!(path[2][1] * path[4][1] < 0.0, "barbs on opposite sides");
+        // A short arrow keeps its head under half its length.
+        let short = arrow_path([0.0, 0.0], [10.0, 0.0], 8.0);
+        assert!(10.0 - short[2][0] < 5.0, "{short:?}");
+    }
 
     const RED: Rgba = [255, 0, 0, 255];
 
