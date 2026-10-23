@@ -1636,11 +1636,7 @@ impl PaintApp {
             .map(|img| Image {
                 width: img.width,
                 height: img.height,
-                pixels: img
-                    .bytes
-                    .chunks_exact(4)
-                    .map(|p| [p[0], p[1], p[2], p[3]])
-                    .collect(),
+                pixels: img.bytes.as_chunks::<4>().0.to_vec(),
             })
             .or_else(|| self.clipboard.clone());
         if let Some(image) = image {

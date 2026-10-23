@@ -75,11 +75,7 @@ pub fn load(path: &Path) -> Result<Image, String> {
     Ok(Image {
         width: w as usize,
         height: h as usize,
-        pixels: img
-            .into_raw()
-            .chunks_exact(4)
-            .map(|p| [p[0], p[1], p[2], p[3]])
-            .collect(),
+        pixels: img.into_raw().as_chunks::<4>().0.to_vec(),
     })
 }
 
