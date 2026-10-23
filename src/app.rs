@@ -1015,6 +1015,11 @@ impl PaintApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        // Flat buttons that only light up on hover, like a title bar's menus.
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+        widgets.inactive.bg_stroke = Stroke::NONE;
+        widgets.hovered.bg_stroke = Stroke::NONE;
         // Wraps onto a second row when the window is too narrow.
         ui.horizontal_wrapped(|ui| {
             self.file_menu(ui);
