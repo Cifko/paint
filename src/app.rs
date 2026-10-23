@@ -1766,7 +1766,9 @@ impl PaintApp {
         frame
             .handles(self.scale())
             .into_iter()
-            .find(|(_, at)| self.to_screen(rect, *at).distance(pos) <= 8.0)
+            .map(|(h, at)| (h, self.to_screen(rect, at).distance(pos)))
+            .filter(|&(_, d)| d <= 8.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(h, _)| h)
     }
 
@@ -2216,9 +2218,10 @@ impl PaintApp {
                 start,
                 frame,
             }) => {
-                let m = frame.drag(*handle, *start, p, snap);
+                let (m, center) = frame.drag(*handle, *start, p, snap);
                 if let Some(f) = &mut self.floating {
                     f.set_matrix(m);
+                    f.center = center;
                 }
             }
             Some(Gesture::Resize { anchor, start_size }) => {
@@ -2902,6 +2905,8 @@ impl PaintApp {
                     Handle::Rotate => CursorIcon::Grab,
                     Handle::SkewTop | Handle::SkewBottom => CursorIcon::ResizeHorizontal,
                     Handle::SkewLeft | Handle::SkewRight => CursorIcon::ResizeVertical,
+                    Handle::Scale(0 | 2) => CursorIcon::ResizeNwSe,
+                    Handle::Scale(_) => CursorIcon::ResizeNeSw,
                 });
                 return;
             }
@@ -3211,7 +3216,8 @@ fn marching_ants_polygon(painter: &egui::Painter, corners: &[Pos2]) {
     ));
 }
 
-/// Draws transform handles: a round rotate handle on a stalk, diamonds for skew.
+/// Draws transform handles: a round rotate handle on a stalk, diamonds for
+/// skew, squares for scale.
 fn paint_handles(painter: &egui::Painter, handles: &[(Handle, Pos2)]) {
     let fill = Color32::WHITE;
     let line = Stroke::new(1.0, Color32::from_gray(60));
@@ -3225,6 +3231,9 @@ fn paint_handles(painter: &egui::Painter, handles: &[(Handle, Pos2)]) {
                 painter.line_segment([top, at], line);
             }
             painter.circle(at, 5.5, fill, line);
+        } else if let Handle::Scale(_) = handle {
+            let r = Rect::from_center_size(at, Vec2::splat(8.0));
+            painter.rect(r, 1.0, fill, line, egui::StrokeKind::Middle);
         } else {
             let r = 5.0;
             painter.add(Shape::convex_polygon(

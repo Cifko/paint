@@ -14,7 +14,7 @@ Written in Rust with [egui/eframe](https://github.com/emilk/egui); runs on Windo
 - **Tools** – Brush, Eraser, Flood fill, Shapes (rectangle, ellipse, triangle, regular
   n-gon – outline or filled – line and polyline),
   Grid, rectangle Select, Text.
-- **Transform** – rotate, skew and mirror the selection or a pasted image with handles
+- **Transform** – rotate, scale, skew and mirror the selection or a pasted image with handles
   right on the canvas.
 - **Copy / paste** – copy a selected rectangle, paste images from the system clipboard
   (e.g. a screenshot from the Snipping Tool), then move the pasted piece into place.
@@ -96,6 +96,8 @@ Select tool, dragging inside the selection lifts its pixels so they can be moved
 same way. Around a selection or pasted image:
 
 - the round handle above it rotates (`Shift` snaps to 15°),
+- the squares on its corners scale it, keeping the opposite corner in place (`Shift`
+  keeps the proportions; dragging past the opposite corner mirrors it),
 - the diamonds on its edges skew it,
 - the bar below it mirrors left/right or top/bottom and turns by 90°.
 
