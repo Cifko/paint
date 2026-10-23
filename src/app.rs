@@ -549,6 +549,17 @@ impl PaintApp {
             self.undo();
         }
         if let Some(tool) = tool {
+            // Pressing the key of the current tool cycles through its kinds.
+            if tool == self.tool {
+                match tool {
+                    Tool::Shape => self.shape_kind = next_of(&ShapeKind::ALL, self.shape_kind),
+                    Tool::Grid => {
+                        self.grid_kind = next_of(&GridKind::ALL, self.grid_kind);
+                        self.grid = None;
+                    }
+                    _ => {}
+                }
+            }
             self.tool = tool;
         }
         if let Some(kind) = shape {
@@ -3029,6 +3040,12 @@ fn collapsed_window_width(ctx: &egui::Context, title: &str) -> f32 {
     });
     let frame = egui::Frame::window(&style);
     button + style.spacing.item_spacing.x + text + frame.total_margin().sum().x
+}
+
+/// The item after `current` in `all`, wrapping around.
+fn next_of<T: Copy + PartialEq>(all: &[T], current: T) -> T {
+    let i = all.iter().position(|&x| x == current).unwrap_or(0);
+    all[(i + 1) % all.len()]
 }
 
 /// A menu entry showing its shortcut; closes the menu when clicked.
