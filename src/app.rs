@@ -96,6 +96,9 @@ enum PendingAction {
     Open(PathBuf),
 }
 
+/// Where the Buy Me a Coffee button in the toolbar leads.
+const SUPPORT_URL: &str = "https://www.buymeacoffee.com/cifko";
+
 /// Shortcuts that pick a shape (and the Shape tool).
 const SHAPE_ACTIONS: [(Command, ShapeKind); 6] = [
     (Command::ShapeRectangle, ShapeKind::Rectangle),
@@ -1167,6 +1170,10 @@ impl PaintApp {
                 if resp.secondary_clicked() {
                     self.secondary = c;
                 }
+            }
+            ui.separator();
+            if coffee_button(ui).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(SUPPORT_URL));
             }
         });
     }
@@ -3093,6 +3100,30 @@ fn menu_item(ui: &mut egui::Ui, enabled: bool, label: &str, shortcut: &str) -> b
         ui.close();
     }
     clicked
+}
+
+/// The Buy Me a Coffee cup logo on a small white tile (its dark outline
+/// needs a light background), sized like the tool buttons.
+fn coffee_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    let texture = icons::png_texture(
+        ui.ctx(),
+        "bmc_logo",
+        include_bytes!("../assets/bmc-logo.png"),
+    );
+    let tile = rect.shrink(3.0);
+    let fill = if resp.hovered() {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(232)
+    };
+    ui.painter().rect_filled(tile, 4.0, fill);
+    let [w, h] = texture.size().map(|v| v as f32);
+    let logo = Rect::from_center_size(tile.center(), Vec2::new(w / h * 16.0, 16.0));
+    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    ui.painter().image(texture.id(), logo, uv, Color32::WHITE);
+    resp.on_hover_text("Buy me a coffee")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: Icon, selected: bool) -> egui::Response {

@@ -81,21 +81,11 @@ pub fn show(ui: &mut egui::Ui, custom: bool, title: &str, content: impl FnOnce(&
 
 /// The app's icon at the start of the bar, like in VS Code.
 fn app_icon(ui: &mut egui::Ui, height: f32) {
-    let id = egui::Id::unique("app_icon_texture");
-    let texture = ui.data_mut(|d| d.get_temp::<egui::TextureHandle>(id));
-    let texture = texture.unwrap_or_else(|| {
-        let png = include_bytes!("../assets/icons/64.png");
-        let image = image::load_from_memory(png)
-            .expect("bundled icon is a valid PNG")
-            .into_rgba8();
-        let size = [image.width() as usize, image.height() as usize];
-        let image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-        let texture = ui
-            .ctx()
-            .load_texture("app_icon", image, egui::TextureOptions::LINEAR);
-        ui.data_mut(|d| d.insert_temp(id, texture.clone()));
-        texture
-    });
+    let texture = crate::icons::png_texture(
+        ui.ctx(),
+        "app_icon",
+        include_bytes!("../assets/icons/64.png"),
+    );
     let (rect, _) = ui.allocate_exact_size(Vec2::new(height + 4.0, height), Sense::hover());
     let icon = Rect::from_center_size(rect.center(), Vec2::splat(20.0));
     let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
