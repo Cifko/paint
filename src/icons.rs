@@ -1,6 +1,6 @@
 //! Toolbar icons, drawn as vector shapes so they stay crisp at any DPI.
 
-use eframe::egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, Color32, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Icon {
@@ -23,6 +23,22 @@ pub enum Icon {
     FlipVertical,
     RotateLeft,
     RotateRight,
+}
+
+/// A bundled PNG as a texture, decoded on first use and kept for later frames.
+pub fn png_texture(ctx: &egui::Context, name: &str, png: &'static [u8]) -> egui::TextureHandle {
+    let id = egui::Id::unique("png_texture").with(name);
+    if let Some(texture) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return texture;
+    }
+    let image = image::load_from_memory(png)
+        .expect("bundled image is a valid PNG")
+        .into_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    let texture = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+    texture
 }
 
 /// Draws `icon` inside `rect` using `color`.
