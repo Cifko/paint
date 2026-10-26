@@ -1,0 +1,34 @@
+[package]
+name = "paint"
+version = "0.1.0"
+description = "A simple, fast-loading paint program"
+rust-version = "1.95"
+edition = "2024"
+
+[dependencies]
+ab_glyph = "0.2"
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+dejavu = "2.37"
+eframe = { version = "0.37", features = ["persistence"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pollster = "1"
+
+# Keep debug builds responsive enough to paint with.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+
+[dev-dependencies]
+ron = "0.12"
+
+[build-dependencies]
+winresource = "0.1"

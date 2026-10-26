@@ -1,0 +1,226 @@
+//! Toolbar icons, drawn as vector shapes so they stay crisp at any DPI.
+
+use eframe::egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Icon {
+    Brush,
+    Eraser,
+    Fill,
+    Rectangle,
+    Ellipse,
+    Triangle,
+    NGon,
+    Line,
+    Arrow,
+    Polyline,
+    Grid,
+    TriangleGrid,
+    HexagonGrid,
+    Select,
+    Text,
+    FlipHorizontal,
+    FlipVertical,
+    RotateLeft,
+    RotateRight,
+}
+
+/// Draws `icon` inside `rect` using `color`.
+pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    // Icons are designed on a 0..1 square.
+    let s = rect.width().min(rect.height());
+    let origin = rect.center() - Vec2::splat(s / 2.0);
+    let p = |x: f32, y: f32| -> Pos2 { origin + Vec2::new(x, y) * s };
+    let thin = Stroke::new((s * 0.08).max(1.0), color);
+
+    match icon {
+        Icon::Brush => {
+            // Handle, ferrule and a round bristle tip.
+            painter.line_segment([p(0.88, 0.12), p(0.52, 0.48)], Stroke::new(s * 0.12, color));
+            painter.add(Shape::convex_polygon(
+                vec![p(0.46, 0.42), p(0.58, 0.54), p(0.44, 0.68), p(0.32, 0.56)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::convex_polygon(
+                vec![
+                    p(0.32, 0.58),
+                    p(0.42, 0.68),
+                    p(0.30, 0.86),
+                    p(0.12, 0.88),
+                    p(0.16, 0.72),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Eraser => {
+            // A tilted block with its rubber end filled.
+            let body = [p(0.55, 0.15), p(0.88, 0.48), p(0.50, 0.86), p(0.17, 0.53)];
+            painter.add(Shape::convex_polygon(
+                vec![body[3], p(0.36, 0.34), p(0.69, 0.67), body[2]],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(body.to_vec(), thin));
+            painter.line_segment([p(0.30, 0.90), p(0.85, 0.90)], thin);
+        }
+        Icon::Fill => {
+            // A tipped bucket with a drop of paint.
+            let bucket = vec![p(0.40, 0.18), p(0.74, 0.52), p(0.46, 0.80), p(0.12, 0.46)];
+            painter.add(Shape::closed_line(bucket, thin));
+            painter.add(Shape::convex_polygon(
+                vec![p(0.12, 0.46), p(0.74, 0.52), p(0.46, 0.80)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.line_segment([p(0.40, 0.18), p(0.46, 0.06)], thin);
+            painter.circle_filled(p(0.84, 0.74), s * 0.09, color);
+            painter.add(Shape::convex_polygon(
+                vec![p(0.84, 0.54), p(0.92, 0.72), p(0.76, 0.72)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Rectangle => {
+            painter.rect_stroke(
+                Rect::from_min_max(p(0.12, 0.24), p(0.88, 0.76)),
+                0.0,
+                thin,
+                StrokeKind::Middle,
+            );
+        }
+        Icon::Ellipse => {
+            let pts: Vec<Pos2> = (0..=48)
+                .map(|i| {
+                    let t = i as f32 / 48.0 * std::f32::consts::TAU;
+                    p(0.5 + 0.40 * t.cos(), 0.5 + 0.30 * t.sin())
+                })
+                .collect();
+            painter.add(Shape::line(pts, thin));
+        }
+        Icon::Triangle => {
+            let pts = vec![p(0.5, 0.16), p(0.88, 0.82), p(0.12, 0.82)];
+            painter.add(Shape::closed_line(pts, thin));
+        }
+        Icon::NGon => {
+            // A pentagon with a flat bottom.
+            let pts: Vec<Pos2> = (0..5)
+                .map(|i| {
+                    let a = std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / 5.0;
+                    p(0.5 + 0.38 * a.cos(), 0.54 - 0.38 * a.sin())
+                })
+                .collect();
+            painter.add(Shape::closed_line(pts, thin));
+        }
+        Icon::Line => {
+            painter.line_segment([p(0.16, 0.84), p(0.84, 0.16)], thin);
+        }
+        Icon::Arrow => {
+            let tip = p(0.84, 0.16);
+            painter.line_segment([p(0.16, 0.84), tip], thin);
+            painter.add(Shape::line(vec![p(0.46, 0.16), tip, p(0.84, 0.54)], thin));
+        }
+        Icon::Polyline => {
+            let pts = [p(0.12, 0.78), p(0.36, 0.3), p(0.62, 0.66), p(0.88, 0.2)];
+            painter.add(Shape::line(pts.to_vec(), thin));
+            for pt in pts {
+                painter.circle_filled(pt, s * 0.07, color);
+            }
+        }
+        Icon::Grid => {
+            for i in 0..4 {
+                let t = 0.14 + i as f32 * 0.24;
+                painter.line_segment([p(t, 0.14), p(t, 0.86)], thin);
+                painter.line_segment([p(0.14, t), p(0.86, t)], thin);
+            }
+        }
+        Icon::TriangleGrid => {
+            let tri = [
+                [p(0.06, 0.8), p(0.28, 0.24), p(0.5, 0.8)],
+                [p(0.28, 0.24), p(0.72, 0.24), p(0.5, 0.8)],
+                [p(0.5, 0.8), p(0.72, 0.24), p(0.94, 0.8)],
+            ];
+            for t in tri {
+                painter.add(Shape::closed_line(t.to_vec(), thin));
+            }
+        }
+        Icon::HexagonGrid => {
+            let hex = |cx: f32, cy: f32, r: f32| -> Vec<Pos2> {
+                (0..6)
+                    .map(|i| {
+                        let a = i as f32 * std::f32::consts::FRAC_PI_3;
+                        p(cx + r * a.cos(), cy + r * 0.87 * a.sin())
+                    })
+                    .collect()
+            };
+            painter.add(Shape::closed_line(hex(0.3, 0.36, 0.24), thin));
+            painter.add(Shape::closed_line(hex(0.66, 0.57, 0.24), thin));
+        }
+        Icon::Text => {
+            let bold = Stroke::new((s * 0.14).max(1.5), color);
+            painter.line_segment([p(0.18, 0.18), p(0.82, 0.18)], bold);
+            painter.line_segment([p(0.5, 0.18), p(0.5, 0.86)], bold);
+            painter.line_segment([p(0.36, 0.86), p(0.64, 0.86)], thin);
+        }
+        Icon::FlipHorizontal | Icon::FlipVertical => {
+            // Two mirrored arrowheads across a dashed axis.
+            let flip = |x: f32, y: f32| {
+                if icon == Icon::FlipHorizontal {
+                    p(x, y)
+                } else {
+                    p(y, x)
+                }
+            };
+            painter.extend(Shape::dashed_line(
+                &[flip(0.5, 0.08), flip(0.5, 0.92)],
+                thin,
+                s * 0.08,
+                s * 0.06,
+            ));
+            painter.add(Shape::convex_polygon(
+                vec![flip(0.4, 0.22), flip(0.4, 0.78), flip(0.08, 0.5)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::closed_line(
+                vec![flip(0.6, 0.22), flip(0.92, 0.5), flip(0.6, 0.78)],
+                thin,
+            ));
+        }
+        Icon::RotateLeft | Icon::RotateRight => {
+            // Three quarters of a circle, starting at the top, with an
+            // arrowhead at its end pointing the way it turns.
+            let dir = if icon == Icon::RotateRight { 1.0 } else { -1.0 };
+            let sweep = 4.6;
+            let angle = |i: usize| -std::f32::consts::FRAC_PI_2 + dir * i as f32 / 24.0 * sweep;
+            let arc: Vec<Pos2> = (0..=24)
+                .map(|i| p(0.5 + 0.3 * angle(i).cos(), 0.54 + 0.3 * angle(i).sin()))
+                .collect();
+            let end = *arc.last().expect("arc has points");
+            painter.add(Shape::line(arc, thin));
+            let a = angle(24);
+            let travel = Vec2::new(-a.sin(), a.cos()) * dir;
+            let side = Vec2::new(-travel.y, travel.x);
+            painter.add(Shape::convex_polygon(
+                vec![
+                    end + travel * s * 0.16,
+                    end + side * s * 0.13,
+                    end - side * s * 0.13,
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Select => {
+            let pts = [
+                p(0.14, 0.2),
+                p(0.86, 0.2),
+                p(0.86, 0.8),
+                p(0.14, 0.8),
+                p(0.14, 0.2),
+            ];
+            painter.extend(Shape::dashed_line(&pts, thin, s * 0.12, s * 0.08));
+        }
+    }
+}
