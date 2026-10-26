@@ -191,10 +191,6 @@ The Windows screenshot above is taken by the `Screenshots` workflow: it opens
 capture to the run as the `windows-screenshot` artifact, to download and commit as
 `docs/screenshots/windows.png`.
 
-<p align="center">
-  <a href="https://www.buymeacoffee.com/cifko"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
 ### Releasing
 
 Run the **Release** workflow from the Actions tab (**Run workflow**). Enter the version
@@ -202,3 +198,7 @@ Run the **Release** workflow from the Actions tab (**Run workflow**). Enter the 
 Linux and macOS (Apple Silicon and Intel) packages and creates the `v<version>`
 release with them attached and notes generated from the commits. It's a draft unless
 you untick **draft**, so you can check it and publish it from the Releases page.
+
+<p align="center">
+  <a href="https://www.buymeacoffee.com/cifko"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
+</p>
