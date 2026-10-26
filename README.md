@@ -185,3 +185,7 @@ The Windows screenshot above is taken by the `Screenshots` workflow: it opens
 `docs/screenshots/demo.png` in a release build on a Windows runner and attaches the
 capture to the run as the `windows-screenshot` artifact, to download and commit as
 `docs/screenshots/windows.png`.
+
+<p align="center">
+  <a href="https://www.buymeacoffee.com/cifko"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
+</p>
