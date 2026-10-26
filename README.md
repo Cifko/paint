@@ -182,4 +182,6 @@ cargo fmt
 | `src/desktop.rs` | The Linux desktop entry and icons |
 
 The Windows screenshot above is taken by the `Screenshots` workflow: it opens
-`docs/screenshots/demo.png` in a release build on a Windows runner.
+`docs/screenshots/demo.png` in a release build on a Windows runner and attaches the
+capture to the run as the `windows-screenshot` artifact, to download and commit as
+`docs/screenshots/windows.png`.

@@ -1,5 +1,6 @@
 # Takes the Windows screenshot for the README: opens docs/screenshots/demo.png
-# in a release build, maximized, and commits the capture back to the branch.
+# in a release build, maximized, and attaches the capture to the run as the
+# `windows-screenshot` artifact. Download it and commit it yourself.
 name: Screenshots
 
 on:
@@ -10,7 +11,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
@@ -53,13 +54,3 @@ jobs:
         with:
           name: windows-screenshot
           path: docs/screenshots/windows.png
-      - name: Commit the screenshot
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git add docs/screenshots/windows.png
-          git commit -m "Update the Windows screenshot" || exit 0
-          # The branch may have moved on while this ran.
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
