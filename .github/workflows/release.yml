@@ -1,0 +1,136 @@
+# Builds Paint for Windows, Linux and macOS and publishes a GitHub release
+# with the packages attached. Started by hand from the Actions tab.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, e.g. 0.2.0 (empty = the version in Cargo.toml)
+        required: false
+        type: string
+      draft:
+        description: Create the release as a draft, to review before publishing
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick the tag
+        id: tag
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${VERSION#v}"
+          if [ -z "$version" ]; then
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          fi
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::$tag already exists; pick another version."
+            exit 1
+          fi
+          echo "Releasing $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package: windows-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package: linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            package: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            package: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    env:
+      NAME: paint-${{ needs.prepare.outputs.tag }}-${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          New-Item -ItemType Directory -Path dist/$env:NAME | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/paint.exe, README.md dist/$env:NAME/
+          Compress-Archive -Path dist/$env:NAME -DestinationPath dist/$env:NAME.zip
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p "dist/$NAME"
+          cp target/${{ matrix.target }}/release/paint README.md "dist/$NAME/"
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          scripts/bundle-macos.sh ${{ matrix.target }}
+          mkdir -p dist
+          # ditto keeps the app bundle's permissions and metadata intact.
+          ditto -c -k --keepParent target/Paint.app "dist/$NAME.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          ls -l dist
+          flags=()
+          if [ "$DRAFT" = "true" ]; then flags+=(--draft); fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Paint $TAG" \
+            --generate-notes \
+            "${flags[@]}"

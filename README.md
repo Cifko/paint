@@ -57,7 +57,12 @@
 
 ## Getting started
 
-Paint is built from source with Rust 1.95 or newer ([rustup](https://rustup.rs)):
+Ready-made builds for Windows, Linux and macOS are on the
+[Releases](https://github.com/cifko/paint/releases) page. The macOS app isn't signed,
+so macOS may refuse to open it at first: right-click it and choose **Open**, or run
+`xattr -dr com.apple.quarantine Paint.app`.
+
+To build it yourself, you need Rust 1.95 or newer ([rustup](https://rustup.rs)):
 
 ```sh
 cargo run --release
@@ -189,3 +194,11 @@ capture to the run as the `windows-screenshot` artifact, to download and commit 
 <p align="center">
   <a href="https://www.buymeacoffee.com/cifko"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
 </p>
+
+### Releasing
+
+Run the **Release** workflow from the Actions tab (**Run workflow**). Enter the version
+(e.g. `0.2.0`) or leave it empty to use the one in `Cargo.toml`. It builds Windows,
+Linux and macOS (Apple Silicon and Intel) packages and creates the `v<version>`
+release with them attached and notes generated from the commits. It's a draft unless
+you untick **draft**, so you can check it and publish it from the Releases page.
