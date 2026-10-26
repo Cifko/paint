@@ -95,6 +95,8 @@ pub struct Settings {
     /// Make pixels of color 2 in pasted images transparent.
     #[serde(alias = "paste_white_transparent")]
     pub paste_secondary_transparent: bool,
+    /// Curve brush and eraser strokes between mouse samples.
+    pub smooth_strokes: bool,
     pub tool_defaults: ToolDefaults,
     /// Use the desktop's own title bar instead of putting the toolbar there
     /// (Windows and Linux; macOS always merges them).
@@ -117,6 +119,7 @@ impl Default for Settings {
             resize_sensitivity: 1.0,
             square_modifier: ModifierKey::Shift,
             paste_secondary_transparent: true,
+            smooth_strokes: true,
             tool_defaults: ToolDefaults::default(),
             system_title_bar: false,
             color_mode: Default::default(),
@@ -243,6 +246,11 @@ impl Settings {
                                     &mut self.paste_secondary_transparent,
                                     defaults.paste_secondary_transparent,
                                 );
+                                ui.end_row();
+
+                                ui.label("Smooth brush strokes");
+                                ui.checkbox(&mut self.smooth_strokes, "");
+                                reset(ui, &mut self.smooth_strokes, defaults.smooth_strokes);
                                 ui.end_row();
                             });
                         if self.square_modifier != ModifierKey::Disabled

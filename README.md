@@ -21,6 +21,8 @@
 - **Tools.** Brush, Eraser, Flood fill, Shapes (rectangle, ellipse, triangle, regular
   n-gon, line, arrow and polyline; outlined or filled), Grid (rectangles, triangles or
   hexagons), rectangle Select and Text.
+- **Smooth strokes.** Brush and eraser strokes curve through the mouse positions, so
+  fast strokes stay round even with a 125 Hz mouse (can be turned off in Settings).
 - **Two colors, like MS Paint.** The left mouse button paints with color 1, the right
   one with color 2. The last palette swatch, **Clear**, makes Fill, Brush, shapes and
   Text erase instead.

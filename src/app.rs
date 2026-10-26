@@ -148,6 +148,8 @@ enum Gesture {
     Stroke {
         op: PaintOp,
         last: [f32; 2],
+        /// Curves the path through the samples, if smoothing is on.
+        smoother: Option<canvas::StrokeSmoother>,
     },
     /// Dragging out a rectangle, ellipse or triangle.
     Shape {
@@ -2204,9 +2206,12 @@ impl PaintApp {
                 self.offset -= (pos - *last) / scale;
                 *last = pos;
             }
-            Some(Gesture::Stroke { op, last }) if p != *last => {
+            Some(Gesture::Stroke { op, last, smoother }) if p != *last => {
                 if let Some(layer) = self.layers.iter_mut().find(|l| l.id == op.layer_id) {
-                    op.stroke_segment(layer, *last, p, size / 2.0);
+                    match smoother {
+                        Some(s) => op.polyline(layer, &s.push(p), size),
+                        None => op.stroke_segment(layer, *last, p, size / 2.0),
+                    }
                 }
                 *last = p;
             }
@@ -2338,7 +2343,15 @@ impl PaintApp {
             Tool::Brush | Tool::Eraser => {
                 let mut op = PaintOp::new(self.active_layer_id(), self.paint_mode());
                 op.stroke_segment(&mut self.layers[self.active], p, p, brush.size / 2.0);
-                self.gesture = Some(Gesture::Stroke { op, last: p });
+                let smoother = self
+                    .settings
+                    .smooth_strokes
+                    .then(|| canvas::StrokeSmoother::new(p));
+                self.gesture = Some(Gesture::Stroke {
+                    op,
+                    last: p,
+                    smoother,
+                });
             }
             Tool::Shape => match self.shape_kind {
                 ShapeKind::Line | ShapeKind::Arrow => {
@@ -2430,17 +2443,28 @@ impl PaintApp {
         };
     }
 
+    /// Draws the rest of a smoothed stroke and commits it.
+    fn finish_stroke(&mut self, mut op: PaintOp, smoother: Option<canvas::StrokeSmoother>) {
+        if let Some(s) = smoother {
+            let size = self.brush().size;
+            if let Some(layer) = self.layers.iter_mut().find(|l| l.id == op.layer_id) {
+                op.polyline(layer, &s.finish(), size);
+            }
+        }
+        self.commit(op);
+    }
+
     fn finish_gesture(&mut self) {
         // Commit without a final pointer position (e.g. undo pressed mid-stroke).
-        if let Some(Gesture::Stroke { op, .. }) = self.gesture.take() {
-            self.commit(op);
+        if let Some(Gesture::Stroke { op, smoother, .. }) = self.gesture.take() {
+            self.finish_stroke(op, smoother);
         }
     }
 
     fn finish_gesture_at(&mut self, rect: Rect, pos: Option<Pos2>) {
         let brush = self.brush();
         match self.gesture.take() {
-            Some(Gesture::Stroke { op, .. }) => self.commit(op),
+            Some(Gesture::Stroke { op, smoother, .. }) => self.finish_stroke(op, smoother),
             Some(Gesture::Shape { start }) => {
                 let Some(pos) = pos else { return };
                 let r = canvas::rect_from_corners(

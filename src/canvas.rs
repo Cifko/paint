@@ -535,6 +535,77 @@ pub fn rect_from_corners(a: [i32; 2], b: [i32; 2]) -> IRect {
     }
 }
 
+/// Turns pointer samples into a smooth path: a centripetal Catmull-Rom
+/// spline through every sample, so fast strokes with few samples (e.g. a
+/// 125 Hz mouse) come out curved instead of as a polygon. Each piece is
+/// known once the sample after it arrives, so drawing lags one sample.
+pub struct StrokeSmoother {
+    /// The latest samples, oldest first: at most the three that the next
+    /// piece depends on.
+    recent: Vec<[f32; 2]>,
+}
+
+impl StrokeSmoother {
+    pub fn new(start: [f32; 2]) -> Self {
+        Self {
+            recent: vec![start],
+        }
+    }
+
+    /// Adds a sample. Returns the points of the piece that became final
+    /// (from its start to its end), or nothing yet.
+    pub fn push(&mut self, p: [f32; 2]) -> Vec<[f32; 2]> {
+        let piece = match self.recent[..] {
+            [a, b] => catmull_rom(a, a, b, p),
+            [a, b, c] => catmull_rom(a, b, c, p),
+            _ => Vec::new(),
+        };
+        self.recent.push(p);
+        if self.recent.len() > 3 {
+            self.recent.remove(0);
+        }
+        piece
+    }
+
+    /// The last piece, up to the last sample.
+    pub fn finish(&self) -> Vec<[f32; 2]> {
+        match self.recent[..] {
+            [a, b] => vec![a, b],
+            [a, b, c] => catmull_rom(a, b, c, c),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Points along the centripetal Catmull-Rom curve from `p1` to `p2`, about
+/// two pixels apart.
+fn catmull_rom(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]) -> Vec<[f32; 2]> {
+    let dist = |a: [f32; 2], b: [f32; 2]| (b[0] - a[0]).hypot(b[1] - a[1]);
+    let len = dist(p1, p2);
+    let steps = (len / 2.0).ceil().clamp(1.0, 256.0) as usize;
+    // Knot spacing: square root of the distances ("centripetal"), which
+    // avoids loops and overshoot. Coincident points get a tiny spacing.
+    let knot = |a, b| dist(a, b).sqrt().max(1e-3);
+    let t1 = knot(p0, p1);
+    let t2 = t1 + knot(p1, p2);
+    let t3 = t2 + knot(p2, p3);
+    let lerp = |a: [f32; 2], b: [f32; 2], ta: f32, tb: f32, t: f32| {
+        let w = (t - ta) / (tb - ta);
+        [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w]
+    };
+    (0..=steps)
+        .map(|i| {
+            let t = t1 + (t2 - t1) * i as f32 / steps as f32;
+            let a1 = lerp(p0, p1, 0.0, t1, t);
+            let a2 = lerp(p1, p2, t1, t2, t);
+            let a3 = lerp(p2, p3, t2, t3, t);
+            let b1 = lerp(a1, a2, 0.0, t2, t);
+            let b2 = lerp(a2, a3, t1, t3, t);
+            lerp(b1, b2, t1, t2, t)
+        })
+        .collect()
+}
+
 /// The stroke path of an arrow from `tail` to `tip` drawn `width` wide:
 /// the shaft, then each barb of the open head and back to the tip. The head
 /// grows with the width but stays under half the arrow's length.
@@ -1325,6 +1396,44 @@ pub fn flood_fill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smoothing_passes_through_the_samples_and_curves_between() {
+        // A fast circle sampled at only 8 points.
+        let samples: Vec<[f32; 2]> = (0..=8)
+            .map(|i| {
+                let a = i as f32 / 8.0 * std::f32::consts::TAU;
+                [100.0 * a.cos(), 100.0 * a.sin()]
+            })
+            .collect();
+        let mut smoother = StrokeSmoother::new(samples[0]);
+        let mut path = vec![samples[0]];
+        for &p in &samples[1..] {
+            path.extend(smoother.push(p));
+        }
+        path.extend(smoother.finish());
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-2;
+        for s in &samples {
+            assert!(path.iter().any(|p| near(*p, *s)), "misses sample {s:?}");
+        }
+        assert!(
+            near(*path.last().unwrap(), samples[8]),
+            "ends at the last sample"
+        );
+        // Between samples (here the second and third, 45° to 90°) the curve
+        // bulges outwards like the circle, where a straight line would cut
+        // inside, to ~92 from the center.
+        let mid = path
+            .iter()
+            .filter(|p| p[1] > p[0] && p[0] > 1.0)
+            .map(|p| p[0].hypot(p[1]))
+            .fold(f32::MAX, f32::min);
+        assert!(mid > 97.0, "closest to the center: {mid}");
+        // Two samples: a straight line.
+        let mut two = StrokeSmoother::new([0.0, 0.0]);
+        assert!(two.push([10.0, 0.0]).is_empty());
+        assert_eq!(two.finish(), vec![[0.0, 0.0], [10.0, 0.0]]);
+    }
 
     #[test]
     fn arrow_head_points_back_from_the_tip() {
